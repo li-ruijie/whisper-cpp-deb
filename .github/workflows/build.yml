@@ -1,0 +1,406 @@
+name: Build whisper.cpp packages
+
+on:
+  schedule:
+    # Deliberately far from llama-cpp-deb at Sunday 21:00 UTC. Two builders
+    # dispatching close together fail the second Pages deployment in
+    # li-ruijie/apt, after its packages have already been built.
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream tag override, for example v1.9.2. Empty means latest."
+        required: false
+        type: string
+      force:
+        description: "Rebuild even when the deployed version already matches"
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: Resolve the upstream tag and decide whether to build
+        id: resolve
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          if [ -n "$VERSION_OVERRIDE" ]; then
+            TAG="$VERSION_OVERRIDE"
+          else
+            # Authenticated, because the anonymous API allows 60 requests an hour
+            # per IP and runners share addresses, which returns 403 in practice.
+            TAG=$(gh api repos/ggml-org/whisper.cpp/releases/latest --jq '.tag_name')
+          fi
+
+          # Upstream tags are semantic versions prefixed with v.
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          DEPLOYED=$(curl -fsSL \
+            https://li-ruijie.github.io/apt/dists/stable/dynamic/binary-amd64/Packages 2>/dev/null \
+            | awk '/^Package: whisper-cpp$/,/^$/' | grep '^Version:' | awk '{print $2}' || true)
+
+          if [ "$VERSION" = "$DEPLOYED" ] && [ "$FORCE" != "true" ]; then
+            echo "Version $VERSION already deployed, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "$VERSION" = "$DEPLOYED" ]; then
+            echo "Rebuilding $VERSION (forced)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version $VERSION (deployed: ${DEPLOYED:-none})"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-base:
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the packaging scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build the base packages
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          mkdir -p dist
+          for pair in x64:amd64 arm64:arm64; do
+            upstream="${pair%%:*}"
+            debarch="${pair##*:}"
+            archive="whisper-bin-ubuntu-${upstream}.tar.gz"
+            curl -fsSL -o "$archive" \
+              "https://github.com/ggml-org/whisper.cpp/releases/download/${TAG}/${archive}"
+            scripts/package-base.sh "$archive" "$VERSION" "$debarch" dist
+          done
+          ls -la dist
+
+      - name: Exercise the model wrapper against the real hub
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # The unit tests stub the hub, so this is the only place the four real
+          # repositories are proven reachable and correctly named.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+          dpkg-deb -x "dist/whisper-cpp_${VERSION}_amd64.deb" tree
+          for family in whisper parakeet vad tdrz; do
+            tree/usr/bin/whisper-model list | grep -q "  $family " \
+              || { echo "::error::the $family family returned no models"; exit 1; }
+          done
+          tree/usr/bin/whisper-model list | head -50
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: debs-base
+          path: dist/*.deb
+          if-no-files-found: error
+
+  build-vulkan:
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout the packaging scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install the Vulkan SDK
+        run: |
+          # LunarG's jammy repository, which is how llama.cpp builds its own
+          # Linux Vulkan release. Ubuntu 22.04's own spirv-headers is too old
+          # for ggml's find_package(SPIRV-Headers CONFIG REQUIRED).
+          # apt-key is deprecated, so the key goes into a keyring drop-in.
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          # mesa-vulkan-drivers supplies lavapipe, a software Vulkan device, so
+          # the smoke test below genuinely executes the backend on a runner with
+          # no GPU rather than merely loading it.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build vulkan-sdk mesa-vulkan-drivers jq
+          vulkaninfo --summary | head -30 || true
+
+      - name: Checkout whisper.cpp
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ needs.check.outputs.tag }}
+          path: whisper.cpp
+
+      - name: ccache
+        uses: ggml-org/ccache-action@1bbbcda0748b3e340dee71a314fa68ffcbd6df79 # v1.2.21
+        with:
+          key: vulkan-ubuntu22.04
+          evict-old-files: 7d
+
+      - name: Build the Vulkan backend
+        working-directory: whisper.cpp
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU=OFF \
+            -DGGML_VULKAN=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+          cmake --build build --target ggml-vulkan -j "$(nproc)"
+
+      - name: Locate the backend
+        id: backend
+        working-directory: whisper.cpp
+        run: |
+          # The output path depends on the generator, so search rather than assume.
+          so=$(find build -name 'libggml-vulkan.so' -type f | head -1)
+          if [ -z "$so" ]; then
+            echo "::error::libggml-vulkan.so was not produced"
+            find build -name '*.so' -type f
+            exit 1
+          fi
+          ls -la "$so"
+          echo "path=$PWD/$so" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm the glibc floor still matches the base package
+        run: |
+          # A backend built above GLIBC_2.34 would load on trixie and fail on
+          # bookworm while the CPU tools kept working, with nothing to say why.
+          so="${{ steps.backend.outputs.path }}"
+          floor=$(readelf -V "$so" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+          echo "highest GLIBC symbol: $floor"
+          case "$floor" in
+            GLIBC_2.3[0-4] | GLIBC_2.[12][0-9] | GLIBC_2.[0-9]) ;;
+            *) echo "::error::backend floor $floor exceeds the base package's GLIBC_2.34"; exit 1 ;;
+          esac
+
+      - name: Build the packages and smoke test them
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          mkdir -p dist
+          archive="whisper-bin-ubuntu-x64.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/ggml-org/whisper.cpp/releases/download/${TAG}/${archive}"
+          scripts/package-base.sh "$archive" "$VERSION" amd64 "$PWD/basedist"
+          scripts/package-vulkan.sh "${{ steps.backend.outputs.path }}" "$VERSION" dist
+          # whisper.cpp is already checked out at the right tag, so point the
+          # smoke test at its own sample. curl needs the file:// scheme, since a
+          # bare path is parsed as a hostname.
+          SAMPLE_URL="file://$PWD/whisper.cpp/samples/jfk.wav" \
+            scripts/smoke-test.sh \
+              "basedist/whisper-cpp_${VERSION}_amd64.deb" \
+              "dist/whisper-cpp-vulkan_${VERSION}_amd64.deb"
+          ls -la dist
+
+      - name: Upload the package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: debs-vulkan
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # Everything that needs the CUDA toolkit happens here, including the smoke
+  # test. The smoke test cannot run on a plain runner: with libcudart and
+  # libcublas absent, every CUDA function shows up as an undefined symbol and
+  # the ABI guard fires on what is really just a missing toolkit. Inside the
+  # container all CUDA libraries resolve, so a remaining undefined symbol means
+  # a genuine disagreement with upstream's prebuilt libggml-base.
+  build-cuda:
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:13.3.1-devel-ubuntu22.04
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ccache ca-certificates curl git jq ninja-build \
+            libgomp1 xz-utils wget
+
+      - name: Install CMake 3.31.12
+        run: |
+          # Ubuntu 22.04 ships CMake 3.22, which rejects a 120a CUDA architecture.
+          # 3.31.12 is inside the range upstream documents as known good.
+          curl -fsSL -o cmake.tar.gz \
+            https://github.com/Kitware/CMake/releases/download/v3.31.12/cmake-3.31.12-linux-x86_64.tar.gz
+          mkdir -p /opt/cmake
+          tar xzf cmake.tar.gz -C /opt/cmake --strip-components=1
+          echo "/opt/cmake/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the toolchain and derive the CUDA package suffix
+        id: toolchain
+        run: |
+          /opt/cmake/bin/cmake --version
+          nvcc --version
+          # The CUDA package the backend depends on has to match the toolkit it
+          # was compiled against, so derive it from nvcc rather than repeating
+          # the container tag. NVIDIA's apt names use 13-3, not 13.3.
+          cuda_release=$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+          if [ -z "$cuda_release" ]; then
+            echo "::error::could not parse the CUDA release from nvcc --version"
+            exit 1
+          fi
+          suffix=$(printf '%s' "$cuda_release" | tr '.' '-')
+          echo "CUDA release $cuda_release, apt suffix $suffix"
+          echo "cuda_suffix=$suffix" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the packaging scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Checkout whisper.cpp
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ needs.check.outputs.tag }}
+          path: whisper.cpp
+
+      - name: ccache
+        uses: ggml-org/ccache-action@1bbbcda0748b3e340dee71a314fa68ffcbd6df79 # v1.2.21
+        with:
+          key: cuda-13.3.1-ubuntu22.04
+          evict-old-files: 7d
+
+      # GGML_CUDA_NCCL defaults to ON and the container ships NCCL, so CMake
+      # would find it and link libnccl.so.2 into the backend. Target machines do
+      # not have NCCL, so the backend would fail to dlopen and ggml would fall
+      # back to CPU without saying why.
+      - name: Build the CUDA backend
+        working-directory: whisper.cpp
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU=OFF \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="89-real;120a-real;90-virtual"
+          cmake --build build --target ggml-cuda -j "$(nproc)"
+
+      - name: Locate the backend
+        id: backend
+        working-directory: whisper.cpp
+        run: |
+          so=$(find build -name 'libggml-cuda.so' -type f | head -1)
+          if [ -z "$so" ]; then
+            echo "::error::libggml-cuda.so was not produced"
+            find build -name '*.so' -type f
+            exit 1
+          fi
+          ls -la "$so"
+          echo "path=$PWD/$so" >> "$GITHUB_OUTPUT"
+          df -h /
+
+      - name: Check the backend links only declared CUDA libraries
+        run: scripts/check-backend-deps.sh "${{ steps.backend.outputs.path }}"
+
+      - name: Build the packages and smoke test them
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+          CUDA_SUFFIX: ${{ steps.toolchain.outputs.cuda_suffix }}
+        run: |
+          mkdir -p dist
+          archive="whisper-bin-ubuntu-x64.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/ggml-org/whisper.cpp/releases/download/${TAG}/${archive}"
+          scripts/package-base.sh "$archive" "$VERSION" amd64 "$PWD/basedist"
+          scripts/package-cuda.sh \
+            "${{ steps.backend.outputs.path }}" "$VERSION" "$CUDA_SUFFIX" dist
+          echo "--- CUDA package dependencies ---"
+          dpkg-deb -f "dist/whisper-cpp-cuda_${VERSION}_amd64.deb" Depends
+
+          # The driver stub ships as libcuda.so, but the backend records a
+          # DT_NEEDED on libcuda.so.1, so give it that name. Adding the toolkit
+          # library directory alongside lets libcudart and libcublas resolve, so
+          # any symbol still undefined afterwards is a real ABI fault.
+          mkdir -p /tmp/stubs
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /tmp/stubs/libcuda.so.1
+          BACKEND_STUB_DIR=/tmp/stubs:/usr/local/cuda/lib64 \
+          SAMPLE_URL="file://$PWD/whisper.cpp/samples/jfk.wav" \
+            scripts/smoke-test.sh \
+              "basedist/whisper-cpp_${VERSION}_amd64.deb" \
+              "dist/whisper-cpp-cuda_${VERSION}_amd64.deb"
+          ls -la dist
+
+      - name: Upload the package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: debs-cuda
+          path: dist/*.deb
+          if-no-files-found: error
+
+  publish:
+    needs: [check, build-base, build-vulkan, build-cuda]
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download every package
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: debs-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          ls -la dist
+          # -R is required: this job does not check out the repository, and
+          # without a git remote gh cannot infer which repository to act on.
+          # A forced rebuild reuses the upstream tag, and gh refuses to create a
+          # release that already exists, so replace it rather than failing.
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            echo "Replacing the existing release for $TAG"
+            gh release delete "$TAG" -R "$REPO" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" dist/*.deb -R "$REPO" \
+            --title "whisper.cpp $TAG" \
+            --notes "Debian packages built from ggml-org/whisper.cpp $TAG (version $VERSION)."
+
+      - name: Dispatch to the APT repository
+        env:
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          base="https://github.com/${REPO}/releases/download/${TAG}"
+          urls=$(for f in dist/*.deb; do printf '"%s/%s",' "$base" "$(basename "$f")"; done)
+          gh api repos/li-ruijie/apt/dispatches -X POST --input - <<EOF
+          {
+            "event_type": "add-debs",
+            "client_payload": { "debs": [ ${urls%,} ] }
+          }
+          EOF
