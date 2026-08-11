@@ -99,9 +99,16 @@ done
 
 # Runtime check. libgomp1 is absent from a clean trixie, so fetch it unprivileged.
 dpkg-deb -x "$deb" "$work/root"
-( cd "$work" && apt-get download libgomp1 >/dev/null 2>&1 )
+# stderr is kept: a mirror outage or stale apt cache would otherwise abort the
+# suite under set -e with nothing printed at all. The library directory is
+# derived from dpkg rather than hardcoded, so this also runs on an arm64 host.
+if ! ( cd "$work" && apt-get download libgomp1 >/dev/null ); then
+    echo "FAIL  could not fetch libgomp1, which the shipped binaries need" >&2
+    exit 1
+fi
 dpkg-deb -x "$work"/libgomp1_*.deb "$work/gomp"
-gomp="$work/gomp/usr/lib/x86_64-linux-gnu"
+multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)
+gomp="$work/gomp/usr/lib/$multiarch"
 
 direct=$(LD_LIBRARY_PATH="$gomp" "$work/root/usr/lib/whisper.cpp/whisper-cli" --help 2>&1 || true)
 assert_contains "binary runs from its real path" "$direct" "usage:"

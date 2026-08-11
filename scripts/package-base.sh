@@ -14,6 +14,21 @@ outdir=$4
 
 here=$(cd "$(dirname "$0")" && pwd)
 
+# Validated for shape, matching package-cuda.sh, which already refuses a
+# malformed CUDA suffix. A version or architecture that is quietly wrong
+# produces a package that installs and then fails to satisfy anything.
+case "$version" in
+    [0-9]*) ;;
+    *) echo "$0: version must begin with a digit, got '$version'" >&2; exit 2 ;;
+esac
+
+case "$arch" in
+    amd64 | arm64) ;;
+    *) echo "$0: architecture must be amd64 or arm64, got '$arch'" >&2; exit 2 ;;
+esac
+
+[ -f "$tarball" ] || { echo "$0: no such file: $tarball" >&2; exit 2; }
+
 # Reached through /usr/bin. Everything else in the archive stays inside
 # /usr/lib/whisper.cpp: main and bench are deprecation stubs built from
 # examples/deprecation-warning, and the test-* binaries need fixture data that

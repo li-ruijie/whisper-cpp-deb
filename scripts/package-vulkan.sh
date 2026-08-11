@@ -11,6 +11,15 @@ backend=$1
 version=$2
 outdir=$3
 
+# Validated for shape, matching package-cuda.sh. A version that is quietly
+# wrong produces a package whose dependency on whisper-cpp can never be met.
+case "$version" in
+    [0-9]*) ;;
+    *) echo "$0: version must begin with a digit, got '$version'" >&2; exit 2 ;;
+esac
+
+[ -f "$backend" ] || { echo "$0: no such file: $backend" >&2; exit 2; }
+
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
 

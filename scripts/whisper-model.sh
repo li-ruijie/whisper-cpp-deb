@@ -27,8 +27,18 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "$1 is required but is not installed"
 }
 
+# model_dir is on every code path, so a bare $HOME under set -u would abort any
+# subcommand with "HOME: unbound variable" rather than saying what to set.
 model_dir() {
-    printf '%s' "${WHISPER_MODEL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/whisper.cpp/models}"
+    if [ -n "${WHISPER_MODEL_DIR:-}" ]; then
+        printf '%s' "$WHISPER_MODEL_DIR"
+    elif [ -n "${XDG_DATA_HOME:-}" ]; then
+        printf '%s' "$XDG_DATA_HOME/whisper.cpp/models"
+    elif [ -n "${HOME:-}" ]; then
+        printf '%s' "$HOME/.local/share/whisper.cpp/models"
+    else
+        die "set WHISPER_MODEL_DIR, XDG_DATA_HOME, or HOME to say where models live"
+    fi
 }
 
 auth=()
@@ -126,19 +136,40 @@ fetch() {  # fetch <id> <url>
     file="$dir/ggml-$id.bin"
     part="$file.part"
 
-    meta=$(head_meta "$url")
+    # A failed HEAD must stop here. Called bare from cmd_download errexit would
+    # catch it, but called guarded from cmd_update errexit is suspended through
+    # the whole nested call, and fetch would carry on with empty metadata,
+    # download the entire file, and then blame the hub for absent headers when
+    # the real cause was an unreachable HEAD.
+    meta=$(head_meta "$url") || return 1
     sha=${meta%% *}
     size=${meta##* }
 
     if [ -f "$part" ] && [ -n "$size" ] && [ "$(stat -c%s "$part")" = "$size" ]; then
         printf '%s: a complete partial file is already present, verifying\n' "$id"
     else
+        # A partial larger than the advertised size sends an unsatisfiable
+        # Range, which no amount of retrying fixes, so start it again instead.
+        if [ -s "$part" ] && [ -n "$size" ] && [ "$(stat -c%s "$part")" -gt "$size" ]; then
+            printf '%s: discarding an oversized partial file\n' "$id" >&2
+            rm -f "$part"
+        fi
         [ -s "$part" ] && resume=(-C -)
         printf 'downloading %s (%s bytes)\n' "$id" "${size:-size unknown}"
+        # --retry-all-errors is deliberately absent. It retries hard 404 and 403
+        # responses five times over 25 seconds to deliver an answer that was
+        # final on the first attempt. The remaining flags still cover transient
+        # failures, which are the ones worth retrying.
+        #
+        # The partial file is deliberately NOT deleted here. This is the one
+        # path that produces a resumable partial, and resume is the reason the
+        # .part file exists at all. The verification failures below do delete
+        # it, since bytes that failed a checksum are worth nothing.
         curl -fL "${auth[@]}" "${resume[@]}" \
-            --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused \
+            --retry 5 --retry-delay 5 --retry-connrefused \
             -o "$part" "$url" \
-            || { rm -f "$part"; printf '%s: %s\n' "$self" "download failed for $id" >&2; return 1; }
+            || { printf '%s: %s\n' "$self" \
+                   "download failed for $id (partial kept for resume)" >&2; return 1; }
     fi
 
     actual=$(local_sha "$part")
@@ -170,13 +201,18 @@ fetch() {  # fetch <id> <url>
         return 1
     fi
 
-    mv -f "$part" "$file"
+    # The sidecar is written before the rename, so an interruption between the
+    # two leaves a stale sidecar with no model rather than a model with no
+    # sidecar. The first is invisible, since nothing reads a sidecar whose model
+    # is absent and the next download overwrites it. The second would make
+    # verify report "no sidecar to check against" for an intact file.
     printf 'sha256=%s\nurl=%s\n' "$actual" "$url" > "$file.sha256"
+    mv -f "$part" "$file"
     printf 'installed %s\n' "$file"
 }
 
 cmd_list() {
-    local dir installed line family id
+    local dir installed index family id
     dir=$(model_dir)
     installed=$(installed_ids || true)
 
@@ -199,11 +235,15 @@ cmd_list() {
 
 cmd_download() {
     [ "$#" -ge 1 ] || die "usage: $self download <model>..." 2
-    local id url
+    local id url status=0
     for id in "$@"; do
-        url=$(resolve_url "$id")
-        fetch "$id" "$url"
+        # Contained per model, matching cmd_update, cmd_remove, and cmd_verify.
+        # Left bare, one bad identifier or one failed checksum would abort the
+        # whole batch and never attempt the models named after it.
+        url=$(resolve_url "$id") || { status=1; continue; }
+        fetch "$id" "$url" || { status=1; continue; }
     done
+    return "$status"
 }
 
 cmd_update() {
@@ -216,7 +256,10 @@ cmd_update() {
         [ -n "$ids" ] || { printf 'no models are installed\n'; return 0; }
     fi
 
-    for id in $ids; do
+    # Read rather than word-split: an unquoted $ids is subject to both word
+    # splitting and pathname expansion, so an identifier containing a glob
+    # character would silently match files in the working directory.
+    while IFS= read -r id; do
         file="$dir/ggml-$id.bin"
         side="$file.sha256"
         if [ ! -f "$file" ]; then
@@ -254,7 +297,7 @@ cmd_update() {
             printf 'warning: no X-Linked-ETag for %s and the size differs, refetching\n' "$id" >&2
             fetch "$id" "$url" || { status=1; continue; }
         fi
-    done
+    done <<< "$ids"
     return "$status"
 }
 
@@ -288,7 +331,10 @@ cmd_verify() {
         [ -n "$ids" ] || { printf 'no models are installed\n'; return 0; }
     fi
 
-    for id in $ids; do
+    # Read rather than word-split: an unquoted $ids is subject to both word
+    # splitting and pathname expansion, so an identifier containing a glob
+    # character would silently match files in the working directory.
+    while IFS= read -r id; do
         file="$dir/ggml-$id.bin"
         if [ ! -f "$file" ]; then
             printf '%s: not installed\n' "$id" >&2
@@ -308,7 +354,7 @@ cmd_verify() {
             printf '%s: CORRUPT (expected %s, got %s)\n' "$id" "$want" "$have" >&2
             status=1
         fi
-    done
+    done <<< "$ids"
     return "$status"
 }
 

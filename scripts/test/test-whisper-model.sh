@@ -4,13 +4,33 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
+# Every clause ends in || true. set -e is active inside a trap, and kill on an
+# already-dead PID is the final command of an && list rather than an exempt
+# condition, so without it the shell exits 1 and aborts the trap mid-flight.
+# That turned a fully passing run into a failure AND leaked the remaining stub
+# servers, whose ports then broke the next run. The two symptoms fed each other.
 trap '
-    rm -rf "$work"
-    [ -n "${srv:-}"  ] && kill "$srv"  2>/dev/null
-    [ -n "${srv2:-}" ] && kill "$srv2" 2>/dev/null
-    [ -n "${srv3:-}" ] && kill "$srv3" 2>/dev/null
-    [ -n "${srv4:-}" ] && kill "$srv4" 2>/dev/null
+    rm -rf "$work" || true
+    [ -n "${srv:-}"  ] && { kill "$srv"  2>/dev/null || true; }
+    [ -n "${srv2:-}" ] && { kill "$srv2" 2>/dev/null || true; }
+    [ -n "${srv3:-}" ] && { kill "$srv3" 2>/dev/null || true; }
+    [ -n "${srv4:-}" ] && { kill "$srv4" 2>/dev/null || true; }
+    [ -n "${srv5:-}" ] && { kill "$srv5" 2>/dev/null || true; }
+    true
 ' EXIT
+
+# Bind to an ephemeral port and read back what the kernel gave us, rather than
+# hardcoding one. A collision on a fixed port produced five seconds of readiness
+# retries and then an errexit abort with no assertion output at all.
+free_port() {
+    python3 -c "
+import socket
+s = socket.socket()
+s.bind(('127.0.0.1', 0))
+print(s.getsockname()[1])
+s.close()
+"
+}
 
 fail=0
 
@@ -122,7 +142,7 @@ printf 'parakeet payload'      > "$work/blobs/ggml-parakeet-tdt-0.6b-v3-f16.bin"
 printf 'silero payload'        > "$work/blobs/ggml-silero-v6.2.0.bin"
 printf 'tdrz payload'          > "$work/blobs/ggml-small.en-tdrz.bin"
 
-port=8731
+port=$(free_port)
 python3 "$work/stub.py" "$work/blobs" "$port" &
 srv=$!
 
@@ -350,7 +370,7 @@ printf 'parakeet payload'      > "$work/edge-blobs/ggml-parakeet-tdt-0.6b-v3-f16
 printf 'silero payload'        > "$work/edge-blobs/ggml-silero-v6.2.0.bin"
 printf 'tdrz payload'          > "$work/edge-blobs/ggml-small.en-tdrz.bin"
 
-port2=8732
+port2=$(free_port)
 STUB_DEAD_REPO="akashmjn/tinydiarize-whisper.cpp" \
 STUB_BAD_ETAG_FILE="ggml-tiny.bin" \
     python3 "$work/stub2.py" "$work/edge-blobs" "$port2" &
@@ -398,7 +418,7 @@ mkdir -p "$work/batch-blobs" "$work/batch-models"
 printf 'aaa payload'    > "$work/batch-blobs/ggml-aaa.bin"
 printf 'bbb payload v1' > "$work/batch-blobs/ggml-bbb.bin"
 
-port3=8733
+port3=$(free_port)
 STUB_BAD_ETAG_FILE="ggml-aaa.bin" \
     python3 "$work/stub2.py" "$work/batch-blobs" "$port3" &
 srv3=$!
@@ -449,7 +469,7 @@ mkdir -p "$work/round3-blobs" "$work/round3-models"
 printf 'nohdr payload'    > "$work/round3-blobs/ggml-nohdr.bin"
 printf 'degraded payload' > "$work/round3-blobs/ggml-degraded.bin"
 
-port4=8734
+port4=$(free_port)
 STUB_NO_HEADERS_FILE="ggml-nohdr.bin" \
 STUB_NO_ETAG_FILE="ggml-degraded.bin" \
     python3 "$work/stub2.py" "$work/round3-blobs" "$port4" &
@@ -495,5 +515,105 @@ status=0; "$wm" download degraded >/dev/null 2>&1 || status=$?
 report "the size-only degraded path still succeeds" 0 "$status"
 assert_equals "the degraded download landed" \
     "$(cat "$work/round3-models/ggml-degraded.bin")" "degraded payload"
+
+# A batch download must reach every identifier named, not stop at the first
+# failure. cmd_update got this after its abort was reproduced; cmd_download had
+# the identical defect and no test, so it shipped. The first model here cannot
+# be verified and must fail, and the second must still be attempted and land.
+rm -rf "$work/batch-models"; mkdir -p "$work/batch-models"
+export WHISPER_MODEL_DIR="$work/batch-models"
+
+status=0; out=$("$wm" download nohdr degraded 2>&1) || status=$?
+report "a batch download reports failure overall" 1 "$status"
+assert_equals "the failing model was not installed" \
+    "$(find "$work/batch-models" -name 'ggml-nohdr.bin' | wc -l)" "0"
+assert_equals "the batch continued past the failure" \
+    "$(cat "$work/batch-models/ggml-degraded.bin" 2>/dev/null || echo MISSING)" "degraded payload"
+
+# An unknown identifier must not abort the batch either, since resolve_url
+# reports it through a different path than a failed fetch.
+rm -rf "$work/batch-models"; mkdir -p "$work/batch-models"
+status=0; "$wm" download not-a-real-model degraded >/dev/null 2>&1 || status=$?
+report "an unknown identifier does not abort the batch" 1 "$status"
+assert_equals "the model after an unknown one still landed" \
+    "$(cat "$work/batch-models/ggml-degraded.bin" 2>/dev/null || echo MISSING)" "degraded payload"
+
+# Resume is the reason the .part file exists, and a network failure is the case
+# it exists for. The download-failure path must therefore keep the partial
+# rather than delete it. A stub that closes the connection partway leaves a
+# short .part, which must survive for the next attempt to continue from.
+cat > "$work/truncating.py" <<'PYEOF'
+import http.server, json, sys
+
+PORT = int(sys.argv[1])
+BODY = b"x" * 4096
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    # Only the whisper repository lists this model. Serving the same listing for
+    # all four would make the identifier ambiguous across every family, and
+    # resolve_url would reject it before a download was ever attempted.
+    LISTS = "/api/models/ggerganov/whisper.cpp"
+
+    def do_HEAD(self):
+        if self.path.startswith("/api/models/"):
+            if self.path != self.LISTS:
+                self.send_error(404); return
+            self.send_response(200); self.end_headers(); return
+        self.send_response(200)
+        self.send_header("X-Linked-ETag", '"%s"' % ("0" * 64))
+        self.send_header("X-Linked-Size", str(len(BODY)))
+        self.send_header("Content-Length", str(len(BODY)))
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path.startswith("/api/models/"):
+            if self.path != self.LISTS:
+                self.send_error(404); return
+            body = json.dumps({"siblings": [{"rfilename": "ggml-trunc.bin"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # Promise the full length, send a fraction, then drop the connection.
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(BODY)))
+        self.end_headers()
+        self.wfile.write(BODY[:512])
+        self.wfile.flush()
+        self.close_connection = True
+
+http.server.HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+PYEOF
+
+port5=$(free_port)
+python3 "$work/truncating.py" "$port5" &
+srv5=$!
+for _ in $(seq 1 50); do
+    curl -fsS "http://127.0.0.1:$port5/api/models/ggerganov/whisper.cpp" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+
+rm -rf "$work/resume-models"; mkdir -p "$work/resume-models"
+export WHISPER_HF_ENDPOINT="http://127.0.0.1:$port5"
+export WHISPER_MODEL_DIR="$work/resume-models"
+
+status=0; "$wm" download trunc >/dev/null 2>&1 || status=$?
+report "a truncated download fails" 1 "$status"
+assert_equals "no model file was installed" \
+    "$(find "$work/resume-models" -name 'ggml-trunc.bin' | wc -l)" "0"
+assert_equals "the partial file is KEPT so the next attempt can resume" \
+    "$(find "$work/resume-models" -name 'ggml-trunc.bin.part' | wc -l)" "1"
+assert_equals "the partial holds the bytes that did arrive" \
+    "$(stat -c%s "$work/resume-models/ggml-trunc.bin.part")" "512"
+
+# An oversized partial must be discarded rather than sending an unsatisfiable
+# Range that no amount of retrying can fix.
+printf '%*s' 9000 '' > "$work/resume-models/ggml-trunc.bin.part"
+status=0; err=$("$wm" download trunc 2>&1) || status=$?
+assert_contains "an oversized partial is discarded" "$err" "oversized partial"
 
 exit "$fail"
