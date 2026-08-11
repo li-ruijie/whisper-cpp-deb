@@ -183,36 +183,30 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential ninja-build vulkan-sdk mesa-vulkan-drivers jq
 
-      # The smoke test asserts the Vulkan backend actually ran, so this runner
-      # must offer a device. It has no GPU, which leaves lavapipe, mesa's
-      # software rasteriser. Select it explicitly: the loader enumerates every
-      # installed ICD, and a broken one earlier in the list (virtio-gpu returns
-      # -3 here) is enough to leave the enumeration empty.
+      # Diagnostic only, deliberately not an assertion. This runner has no GPU,
+      # and lavapipe cannot stand in for one: ggml_vk_device_is_supported in
+      # ggml-vulkan.cpp gates solely on VkPhysicalDeviceVulkan11Features
+      # .storageBuffer16BitAccess, which this llvmpipe build does not provide,
+      # so ggml reports "No devices found" even though vulkaninfo enumerates it.
       #
-      # This step fails loudly rather than letting the job proceed. Discovering
-      # "no device" later, as a CPU fallback inside the smoke test, names the
-      # symptom rather than the cause.
-      - name: Select a Vulkan device
+      # That is a capability gap rather than a configuration one, so no amount
+      # of ICD selection fixes it, and the job therefore cannot assert that the
+      # backend executed. It asserts that the backend loads, links only declared
+      # libraries, and resolves every symbol against the base package, which is
+      # exactly what build-cuda asserts and for the same reason. Execution is
+      # provable only on real hardware.
+      - name: Report what Vulkan the runner offers
+        continue-on-error: true
         run: |
           echo "--- installed ICDs ---"
           ls -la /usr/share/vulkan/icd.d/ || true
           lvp=$(ls /usr/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -1 || true)
-          if [ -n "$lvp" ]; then
-            echo "using lavapipe at $lvp"
-            echo "VK_ICD_FILENAMES=$lvp" >> "$GITHUB_ENV"
-            export VK_ICD_FILENAMES="$lvp"
-          else
-            echo "::warning::no lavapipe ICD found, falling back to loader defaults"
-          fi
+          [ -n "$lvp" ] && export VK_ICD_FILENAMES="$lvp"
           echo "--- vulkaninfo ---"
-          vulkaninfo --summary || true
-          if ! vulkaninfo --summary 2>/dev/null | grep -q 'deviceName'; then
-            echo "::error::no Vulkan device is available on this runner"
-            echo "The smoke test asserts the Vulkan backend runs, which needs a device."
-            echo "Either install a working software ICD, or drop EXPECT_BACKEND from"
-            echo "the smoke test step and accept a load-and-ABI test as CUDA has."
-            exit 1
-          fi
+          vulkaninfo --summary 2>&1 | head -40 || true
+          echo "--- storageBuffer16BitAccess, which ggml requires ---"
+          vulkaninfo 2>/dev/null | grep -i 'storageBuffer16BitAccess' | head -4 || \
+            echo "(not reported)"
 
       - name: Checkout whisper.cpp
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -283,13 +277,14 @@ jobs:
           # smoke test at its own sample. curl needs the file:// scheme, since a
           # bare path is parsed as a hostname.
           #
-          # EXPECT_BACKEND is the assertion that matters here. The transcription
-          # alone passes identically on CPU, so without it this job would go
-          # green whether lavapipe ran the work or Vulkan silently declined to
-          # load. mesa-vulkan-drivers gives this runner a real software device,
-          # so demanding it is fair.
+          # EXPECT_BACKEND is deliberately NOT set. It was tried and it fails
+          # here, correctly: ggml rejects lavapipe for want of
+          # storageBuffer16BitAccess, so the backend loads and then enumerates
+          # no device. The smoke test still proves the backend resolves every
+          # symbol against the base package and that a package claiming to ship
+          # a backend actually ships one. Whether it executes is provable only
+          # on real hardware, where EXPECT_BACKEND does work.
           SAMPLE_URL="file://$PWD/whisper.cpp/samples/jfk.wav" \
-          EXPECT_BACKEND=Vulkan \
             scripts/smoke-test.sh \
               "basedist/whisper-cpp_${VERSION}_amd64.deb" \
               "dist/whisper-cpp-vulkan_${VERSION}_amd64.deb"
