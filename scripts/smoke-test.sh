@@ -32,9 +32,11 @@ tree="$work/root/usr/lib/whisper.cpp"
 export LD_LIBRARY_PATH="$tree${BACKEND_STUB_DIR:+:$BACKEND_STUB_DIR}"
 
 status=0
+found_backend=""
 
 for backend in libggml-cuda.so libggml-vulkan.so; do
     [ -f "$tree/$backend" ] || continue
+    found_backend=$backend
     echo "== resolving $backend against the base package =="
     # ldd -r performs relocation, so it reports undefined symbols rather than
     # only missing libraries. That is the ABI check this whole design rests on.
@@ -62,6 +64,15 @@ for backend in libggml-cuda.so libggml-vulkan.so; do
     fi
 done
 
+# A backend package was passed but no backend shared object reached the tree,
+# which means the loop above checked nothing at all. Without this the job passes
+# on a package that ships the wrong path, or nothing.
+if [ "$#" -eq 2 ] && [ -z "$found_backend" ]; then
+    echo "a backend package was given but no backend landed in $tree" >&2
+    ls -la "$tree" >&2
+    exit 1
+fi
+
 echo "== fetching a model and a sample =="
 export WHISPER_MODEL_DIR="${WHISPER_MODEL_DIR:-$work/models}"
 "$work/root/usr/bin/whisper-model" download "$MODEL_ID"
@@ -79,6 +90,24 @@ printf '%s\n' "$out"
 if ! printf '%s\n' "$out" | grep -qi 'ask not what your country'; then
     echo "the transcription did not contain the expected text" >&2
     status=1
+fi
+
+# The transcription above proves the tree works, but whisper-cli produces the
+# same text on CPU, so on its own it cannot tell a working backend from one that
+# silently declined to load. EXPECT_BACKEND makes the job assert which device
+# actually did the work. The Vulkan job sets it, since mesa-vulkan-drivers gives
+# that runner a real software device. The CUDA job cannot, as a runner with no
+# NVIDIA hardware has nothing for the backend to select.
+if [ -n "${EXPECT_BACKEND:-}" ]; then
+    echo "== confirming the backend was selected =="
+    if printf '%s\n' "$out" | grep -qi "using $EXPECT_BACKEND backend"; then
+        printf '%s\n' "$out" | grep -i 'device\|backend' || true
+    else
+        echo "expected whisper to select the $EXPECT_BACKEND backend, and it did not" >&2
+        echo "this means it fell back to CPU, which the transcription alone cannot show" >&2
+        printf '%s\n' "$out" | grep -i 'device\|backend' >&2 || true
+        status=1
+    fi
 fi
 
 exit "$status"

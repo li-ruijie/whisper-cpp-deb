@@ -14,9 +14,10 @@ report() {  # report <label> <expected-status> <actual-status>
     fi
 }
 
-check() {  # check <label> <expected-status> <soname-list>
+check() {  # check <label> <expected-status> <soname-list> [kind]
     local status=0
-    printf '%s\n' "$3" | "$here/../check-backend-deps.sh" - >/dev/null 2>&1 || status=$?
+    printf '%s\n' "$3" | "$here/../check-backend-deps.sh" - "${4:-cuda}" >/dev/null 2>&1 \
+        || status=$?
     report "$1" "$2" "$status"
 }
 
@@ -58,6 +59,34 @@ else
     printf 'FAIL  the rejection names the offending library\n'
     fail=1
 fi
+
+# Vulkan gets the same guard. The shader toolchain is a build-time dependency
+# whose output is embedded in the backend, so any runtime link to it is a fault.
+# The build runner has the whole LunarG SDK installed, so such a link would
+# resolve there and pass ldd -r in the smoke test, then fail to dlopen on a
+# user's machine and fall back to CPU without saying why.
+check "the declared vulkan set passes" 0 \
+'libvulkan.so.1
+libggml-base.so.0
+libstdc++.so.6
+libm.so.6
+libgcc_s.so.1
+libc.so.6' vulkan
+
+check "shaderc is rejected"      1 "libshaderc_shared.so.1" vulkan
+check "SPIRV-Tools is rejected"  1 "libSPIRV-Tools-shared.so" vulkan
+check "glslang is rejected"      1 "libglslang.so.13" vulkan
+
+# The two kinds must not police each other's libraries, or a CUDA backend would
+# be judged against the Vulkan set and vice versa.
+check "vulkan ignores CUDA sonames" 0 "libcudart.so.13" vulkan
+check "cuda ignores vulkan sonames" 0 "libvulkan.so.1"  cuda
+
+# An unknown kind must be refused rather than silently defaulting to a set that
+# does not apply, which would let anything through.
+status=0
+printf 'libnccl.so.2\n' | "$here/../check-backend-deps.sh" - rocm >/dev/null 2>&1 || status=$?
+report "an unknown backend kind exits 2" 2 "$status"
 
 # Argument validation.
 status=0; "$here/../check-backend-deps.sh" >/dev/null 2>&1 || status=$?
