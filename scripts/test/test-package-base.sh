@@ -133,4 +133,15 @@ assert_equals "ffmpeg is absent from Depends" \
 audio_usage=$("$work/root/usr/bin/whisper-audio" -h 2>&1 || true)
 assert_contains "audio wrapper runs from the package" "$audio_usage" "whisper-audio [-f]"
 
+# A caller passing an output directory that does not exist yet must work. Every
+# other assertion here passes a mktemp directory that already exists, which is
+# why this went unnoticed until CI: the Vulkan and CUDA jobs both hand this
+# script a fresh path, and dpkg-deb failed with a bare "No such file or
+# directory" that named neither the script nor the cause.
+fresh=$("$here/../package-base.sh" "$work/base.tar.gz" "$version" amd64 "$work/does/not/exist/yet")
+assert_equals "creates a missing output directory" \
+    "$fresh" "$work/does/not/exist/yet/whisper-cpp_${version}_amd64.deb"
+[ -f "$fresh" ] && printf 'ok    the package landed in the created directory\n' \
+    || { printf 'FAIL  the package landed in the created directory\n'; fail=1; }
+
 exit "$fail"
