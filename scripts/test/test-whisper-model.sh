@@ -4,7 +4,7 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-trap 'rm -rf "$work"; [ -n "${srv:-}" ] && kill "$srv" 2>/dev/null; [ -n "${srv2:-}" ] && kill "$srv2" 2>/dev/null' EXIT
+trap 'rm -rf "$work"; [ -n "${srv:-}" ] && kill "$srv" 2>/dev/null; [ -n "${srv2:-}" ] && kill "$srv2" 2>/dev/null; [ -n "${srv3:-}" ] && kill "$srv3" 2>/dev/null' EXIT
 
 fail=0
 
@@ -178,10 +178,15 @@ status=0; "$wm" verify tiny >/dev/null 2>&1 || status=$?
 report "verify fails on a corrupted model" 1 "$status"
 
 # Restore, then confirm update is a no-op when the remote has not moved.
+# Stdout only here, not 2>&1: cmd_update has a second, stderr-only message
+# containing the same "up to date" substring (the size-only fallback), so
+# merging streams would let this assertion pass even if ETag extraction broke
+# and the wrong branch fired. No download happens on this path either way, so
+# there is no progress meter this omission could let through.
 "$wm" download tiny >/dev/null 2>&1 || true
 rm -f "$work/models/ggml-tiny.bin" "$work/models/ggml-tiny.bin.sha256"
 "$wm" download tiny >/dev/null 2>&1
-out=$("$wm" update tiny 2>&1)
+out=$("$wm" update tiny 2>/dev/null)
 assert_contains "update is a no-op when unchanged" "$out" "up to date"
 
 # Move the remote, then confirm update notices and refetches. This is the whole
@@ -363,5 +368,53 @@ assert_equals "nothing was installed for the bad checksum" \
     "$(find "$work/edge-models" -name 'ggml-tiny.bin' | wc -l)" "0"
 assert_equals "no .part left behind after a bad checksum" \
     "$(find "$work/edge-models" -name '*.part' | wc -l)" "0"
+
+# fetch's own failures (checksum mismatch, not just head_meta being
+# unreachable) must not let one model in a bare update prevent the rest from
+# being reached. Modelled directly on the reviewer's reproduction: aaa is
+# installed but its hub always advertises a wrong checksum, bbb is installed
+# and its remote has moved, and one bare update covers both.
+mkdir -p "$work/batch-blobs" "$work/batch-models"
+printf 'aaa payload'    > "$work/batch-blobs/ggml-aaa.bin"
+printf 'bbb payload v1' > "$work/batch-blobs/ggml-bbb.bin"
+
+port3=8733
+STUB_BAD_ETAG_FILE="ggml-aaa.bin" \
+    python3 "$work/stub2.py" "$work/batch-blobs" "$port3" &
+srv3=$!
+
+for _ in $(seq 1 50); do
+    curl -fsS "http://127.0.0.1:$port3/x/y/resolve/main/ggml-bbb.bin" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+
+base3="http://127.0.0.1:$port3/x/y/resolve/main"
+
+# Placed directly rather than through download, since aaa's hub can never
+# serve a matching checksum and so download could never have installed it in
+# the first place. This stands in for a model whose upstream checksum started
+# disagreeing with itself sometime after it was installed.
+printf 'aaa payload' > "$work/batch-models/ggml-aaa.bin"
+printf 'sha256=%s\nurl=%s/ggml-aaa.bin\n' \
+    "$(sha256sum "$work/batch-blobs/ggml-aaa.bin" | cut -d' ' -f1)" "$base3" \
+    > "$work/batch-models/ggml-aaa.bin.sha256"
+printf 'bbb payload v1' > "$work/batch-models/ggml-bbb.bin"
+printf 'sha256=%s\nurl=%s/ggml-bbb.bin\n' \
+    "$(sha256sum "$work/batch-blobs/ggml-bbb.bin" | cut -d' ' -f1)" "$base3" \
+    > "$work/batch-models/ggml-bbb.bin.sha256"
+
+# Move bbb's remote, so a bare update must actually refetch it to prove it was
+# reached and updated, rather than merely iterated past.
+printf 'bbb payload v2' > "$work/batch-blobs/ggml-bbb.bin"
+
+export WHISPER_HF_ENDPOINT="http://127.0.0.1:$port3"
+export WHISPER_MODEL_DIR="$work/batch-models"
+
+status=0; out=$("$wm" update 2>&1) || status=$?
+report "a bare update fails overall when one model's fetch fails" 1 "$status"
+assert_contains "the failing model's own reason is reported" "$out" "checksum mismatch"
+assert_contains "a bare update still reaches the model after the failing one" "$out" "bbb"
+assert_equals "the model after the failing one is actually updated on disk" \
+    "$(cat "$work/batch-models/ggml-bbb.bin")" "bbb payload v2"
 
 exit "$fail"

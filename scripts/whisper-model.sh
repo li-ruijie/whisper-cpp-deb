@@ -111,6 +111,11 @@ sidecar_field() {  # sidecar_field <sidecar> <key>
     sed -n "s/^$2=//p" "$1" | head -1
 }
 
+# Its three failure paths (download, checksum mismatch, size mismatch) report
+# with a plain return 1 rather than die, since die calls exit, which would
+# terminate the whole shell from inside this function regardless of any ||
+# guard on the caller. cmd_update relies on that to keep going past one
+# model's failure and reach the rest of a bare update.
 fetch() {  # fetch <id> <url>
     local id=$1 url=$2 dir file part meta sha size actual resume=()
     dir=$(model_dir)
@@ -130,7 +135,7 @@ fetch() {  # fetch <id> <url>
         curl -fL "${auth[@]}" "${resume[@]}" \
             --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused \
             -o "$part" "$url" \
-            || { rm -f "$part"; die "download failed for $id"; }
+            || { rm -f "$part"; printf '%s: %s\n' "$self" "download failed for $id" >&2; return 1; }
     fi
 
     actual=$(local_sha "$part")
@@ -138,13 +143,15 @@ fetch() {  # fetch <id> <url>
     if [ -n "$sha" ]; then
         if [ "$actual" != "$sha" ]; then
             rm -f "$part"
-            die "checksum mismatch for $id (expected $sha, got $actual)"
+            printf '%s: %s\n' "$self" "checksum mismatch for $id (expected $sha, got $actual)" >&2
+            return 1
         fi
     else
         printf 'warning: the hub sent no X-Linked-ETag for %s, checking size only\n' "$id" >&2
         if [ -n "$size" ] && [ "$(stat -c%s "$part")" != "$size" ]; then
             rm -f "$part"
-            die "size mismatch for $id"
+            printf '%s: %s\n' "$self" "size mismatch for $id" >&2
+            return 1
         fi
     fi
 
@@ -222,7 +229,7 @@ cmd_update() {
             [ -f "$side" ] || printf 'sha256=%s\nurl=%s\n' "$have" "$url" > "$side"
         elif [ -n "$want" ]; then
             printf '%s: updating\n' "$id"
-            fetch "$id" "$url"
+            fetch "$id" "$url" || { status=1; continue; }
         elif [ -n "$want_size" ] && [ "$want_size" = "$(stat -c%s "$file")" ]; then
             # The hub stopped sending the checksum header. Fall back to the size
             # rather than refetching, since a needless refetch of large-v3 is
@@ -230,7 +237,7 @@ cmd_update() {
             printf '%s: up to date (size only, the hub sent no X-Linked-ETag)\n' "$id" >&2
         else
             printf 'warning: no X-Linked-ETag for %s and the size differs, refetching\n' "$id" >&2
-            fetch "$id" "$url"
+            fetch "$id" "$url" || { status=1; continue; }
         fi
     done
     return "$status"
