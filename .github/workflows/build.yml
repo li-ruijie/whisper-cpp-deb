@@ -182,7 +182,37 @@ jobs:
           # no GPU rather than merely loading it.
           sudo apt-get install -y --no-install-recommends \
             build-essential ninja-build vulkan-sdk mesa-vulkan-drivers jq
-          vulkaninfo --summary | head -30 || true
+
+      # The smoke test asserts the Vulkan backend actually ran, so this runner
+      # must offer a device. It has no GPU, which leaves lavapipe, mesa's
+      # software rasteriser. Select it explicitly: the loader enumerates every
+      # installed ICD, and a broken one earlier in the list (virtio-gpu returns
+      # -3 here) is enough to leave the enumeration empty.
+      #
+      # This step fails loudly rather than letting the job proceed. Discovering
+      # "no device" later, as a CPU fallback inside the smoke test, names the
+      # symptom rather than the cause.
+      - name: Select a Vulkan device
+        run: |
+          echo "--- installed ICDs ---"
+          ls -la /usr/share/vulkan/icd.d/ || true
+          lvp=$(ls /usr/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -1 || true)
+          if [ -n "$lvp" ]; then
+            echo "using lavapipe at $lvp"
+            echo "VK_ICD_FILENAMES=$lvp" >> "$GITHUB_ENV"
+            export VK_ICD_FILENAMES="$lvp"
+          else
+            echo "::warning::no lavapipe ICD found, falling back to loader defaults"
+          fi
+          echo "--- vulkaninfo ---"
+          vulkaninfo --summary || true
+          if ! vulkaninfo --summary 2>/dev/null | grep -q 'deviceName'; then
+            echo "::error::no Vulkan device is available on this runner"
+            echo "The smoke test asserts the Vulkan backend runs, which needs a device."
+            echo "Either install a working software ICD, or drop EXPECT_BACKEND from"
+            echo "the smoke test step and accept a load-and-ABI test as CUDA has."
+            exit 1
+          fi
 
       - name: Checkout whisper.cpp
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
