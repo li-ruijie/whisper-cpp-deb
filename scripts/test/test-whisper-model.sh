@@ -4,7 +4,13 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-trap 'rm -rf "$work"; [ -n "${srv:-}" ] && kill "$srv" 2>/dev/null; [ -n "${srv2:-}" ] && kill "$srv2" 2>/dev/null; [ -n "${srv3:-}" ] && kill "$srv3" 2>/dev/null' EXIT
+trap '
+    rm -rf "$work"
+    [ -n "${srv:-}"  ] && kill "$srv"  2>/dev/null
+    [ -n "${srv2:-}" ] && kill "$srv2" 2>/dev/null
+    [ -n "${srv3:-}" ] && kill "$srv3" 2>/dev/null
+    [ -n "${srv4:-}" ] && kill "$srv4" 2>/dev/null
+' EXIT
 
 fail=0
 
@@ -254,9 +260,17 @@ import hashlib, http.server, json, os, sys
 ROOT = sys.argv[1]
 DEAD_REPO = os.environ.get("STUB_DEAD_REPO", "")
 BAD_ETAG_FILE = os.environ.get("STUB_BAD_ETAG_FILE", "")
+# For a file matching either of these, the header is left off the response
+# entirely, rather than sent with a wrong value the way BAD_ETAG_FILE does.
+# Both default to "", which never matches a real filename, so leaving them
+# unset reproduces the exact original behaviour used by every test above.
+NO_ETAG_FILE = os.environ.get("STUB_NO_ETAG_FILE", "")
+NO_HEADERS_FILE = os.environ.get("STUB_NO_HEADERS_FILE", "")
 
 REPOS = {
-    "ggerganov/whisper.cpp": ["ggml-tiny.bin", "ggml-base.en.bin"],
+    "ggerganov/whisper.cpp": [
+        "ggml-tiny.bin", "ggml-base.en.bin", "ggml-nohdr.bin", "ggml-degraded.bin"
+    ],
     "ggml-org/parakeet-GGUF": ["ggml-parakeet-tdt-0.6b-v3-f16.bin"],
     "ggml-org/whisper-vad": ["ggml-silero-v6.2.0.bin"],
     "akashmjn/tinydiarize-whisper.cpp": ["ggml-small.en-tdrz.bin"],
@@ -279,7 +293,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.dumps(
                 {"siblings": [{"rfilename": f} for f in REPOS[repo]]}
             ).encode()
-            return ("json", body, None)
+            return ("json", body, None, False, False)
         # /<owner>/<name>/resolve/main/<file>
         parts = path.lstrip("/").split("/")
         if len(parts) == 5 and parts[2] == "resolve" and parts[3] == "main":
@@ -290,7 +304,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sha = hashlib.sha256(data).hexdigest()
             if name == BAD_ETAG_FILE:
                 sha = "0" * 64
-            return ("blob", data, sha)
+            send_etag = name != NO_ETAG_FILE and name != NO_HEADERS_FILE
+            send_size = name != NO_HEADERS_FILE
+            return ("blob", data, sha, send_etag, send_size)
         return None
 
     def do_HEAD(self):
@@ -298,11 +314,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if r is None:
             self.send_error(404)
             return
-        kind, body, sha = r
+        kind, body, sha, send_etag, send_size = r
         self.send_response(200)
         if kind == "blob":
-            self.send_header("X-Linked-ETag", '"%s"' % sha)
-            self.send_header("X-Linked-Size", str(len(body)))
+            if send_etag:
+                self.send_header("X-Linked-ETag", '"%s"' % sha)
+            if send_size:
+                self.send_header("X-Linked-Size", str(len(body)))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
 
@@ -311,11 +329,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if r is None:
             self.send_error(404)
             return
-        kind, body, sha = r
+        kind, body, sha, send_etag, send_size = r
         self.send_response(200)
         if kind == "blob":
-            self.send_header("X-Linked-ETag", '"%s"' % sha)
-            self.send_header("X-Linked-Size", str(len(body)))
+            if send_etag:
+                self.send_header("X-Linked-ETag", '"%s"' % sha)
+            if send_size:
+                self.send_header("X-Linked-Size", str(len(body)))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -416,5 +436,64 @@ assert_contains "the failing model's own reason is reported" "$out" "checksum mi
 assert_contains "a bare update still reaches the model after the failing one" "$out" "bbb"
 assert_equals "the model after the failing one is actually updated on disk" \
     "$(cat "$work/batch-models/ggml-bbb.bin")" "bbb payload v2"
+
+# When the hub sends NEITHER X-Linked-ETag NOR X-Linked-Size, fetch must
+# refuse rather than silently install and record an unverifiable file: doing
+# so would write a sidecar hash computed from the downloaded bytes themselves,
+# which a later "verify" would then always agree with, making corruption
+# permanently undetectable rather than merely undetected. A fourth stub
+# instance is used since neither srv2 nor srv3 can pick up the new
+# STUB_NO_ETAG_FILE / STUB_NO_HEADERS_FILE flags without restarting with a
+# different environment, and stub2.py is reused rather than duplicated again.
+mkdir -p "$work/round3-blobs" "$work/round3-models"
+printf 'nohdr payload'    > "$work/round3-blobs/ggml-nohdr.bin"
+printf 'degraded payload' > "$work/round3-blobs/ggml-degraded.bin"
+
+port4=8734
+STUB_NO_HEADERS_FILE="ggml-nohdr.bin" \
+STUB_NO_ETAG_FILE="ggml-degraded.bin" \
+    python3 "$work/stub2.py" "$work/round3-blobs" "$port4" &
+srv4=$!
+
+for _ in $(seq 1 50); do
+    curl -fsS "http://127.0.0.1:$port4/api/models/ggerganov/whisper.cpp" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+
+export WHISPER_HF_ENDPOINT="http://127.0.0.1:$port4"
+export WHISPER_MODEL_DIR="$work/round3-models"
+
+# download must refuse outright rather than install a file nothing was ever
+# checked against.
+status=0; err=$("$wm" download nohdr 2>&1 >/dev/null) || status=$?
+report "download refuses when the hub sends no verification headers" 1 "$status"
+assert_equals "no model file was created" \
+    "$(find "$work/round3-models" -name 'ggml-nohdr.bin' | wc -l)" "0"
+assert_equals "no .part file was left behind" \
+    "$(find "$work/round3-models" -name '*.part' | wc -l)" "0"
+assert_contains "the message names the missing verification" "$err" "X-Linked-ETag"
+assert_equals "the message does not falsely claim a size check" \
+    "$(printf '%s\n' "$err" | grep -c 'checking size only' || true)" "0"
+
+# update on an already-installed model must leave it untouched rather than
+# overwrite it with unverifiable bytes, for a hub that degrades this way
+# sometime after the model was installed.
+printf 'nohdr payload' > "$work/round3-models/ggml-nohdr.bin"
+printf 'sha256=%s\nurl=http://127.0.0.1:%s/ggerganov/whisper.cpp/resolve/main/ggml-nohdr.bin\n' \
+    "$(sha256sum "$work/round3-blobs/ggml-nohdr.bin" | cut -d' ' -f1)" "$port4" \
+    > "$work/round3-models/ggml-nohdr.bin.sha256"
+
+status=0; "$wm" update nohdr >/dev/null 2>&1 || status=$?
+report "update also refuses when the hub sends no verification headers" 1 "$status"
+assert_equals "the previously installed file was left untouched" \
+    "$(cat "$work/round3-models/ggml-nohdr.bin")" "nohdr payload"
+
+# The degraded path the spec explicitly keeps (X-Linked-Size present but no
+# X-Linked-ETag) must still work: refusing what cannot be verified at all
+# must not also have broken the weaker, but still real, size-only check.
+status=0; "$wm" download degraded >/dev/null 2>&1 || status=$?
+report "the size-only degraded path still succeeds" 0 "$status"
+assert_equals "the degraded download landed" \
+    "$(cat "$work/round3-models/ggml-degraded.bin")" "degraded payload"
 
 exit "$fail"
