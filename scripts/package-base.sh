@@ -28,7 +28,10 @@ trap 'rm -rf "$staging"' EXIT
 
 root="$staging/root"
 libdir="$root/usr/lib/whisper.cpp"
-mkdir -p "$root/DEBIAN" "$libdir" "$root/usr/bin"
+# The output directory is created here rather than assumed. dpkg-deb fails with
+# a bare "No such file or directory" when it is missing, which is what a caller
+# passing a fresh path hits, and the sibling packaging scripts already do this.
+mkdir -p "$root/DEBIAN" "$libdir" "$root/usr/bin" "$outdir"
 
 # dpkg-deb rejects a control directory outside 0755 to 0775, and a restrictive
 # umask on the build host would otherwise produce one.
