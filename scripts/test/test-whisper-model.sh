@@ -4,7 +4,7 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-trap 'rm -rf "$work"; [ -n "${srv:-}" ] && kill "$srv" 2>/dev/null' EXIT
+trap 'rm -rf "$work"; [ -n "${srv:-}" ] && kill "$srv" 2>/dev/null; [ -n "${srv2:-}" ] && kill "$srv2" 2>/dev/null' EXIT
 
 fail=0
 
@@ -143,7 +143,11 @@ assert_equals "identifiers are stripped" \
     "$(printf '%s\n' "$out" | grep -c 'ggml-' || true)" "0"
 
 # download writes the model, the sidecar, and no leftover .part file.
-"$wm" download tiny >/dev/null
+# Stderr is discarded here too: the download curl call intentionally has no
+# -sS, since a real download of a multi-gigabyte model should show progress,
+# but that means it writes bare \r progress-meter updates that must not reach
+# this suite's own terminal output.
+"$wm" download tiny >/dev/null 2>&1
 assert_equals "model written" \
     "$(cat "$work/models/ggml-tiny.bin")" "tiny model payload v1"
 [ -f "$work/models/ggml-tiny.bin.sha256" ] \
@@ -176,14 +180,14 @@ report "verify fails on a corrupted model" 1 "$status"
 # Restore, then confirm update is a no-op when the remote has not moved.
 "$wm" download tiny >/dev/null 2>&1 || true
 rm -f "$work/models/ggml-tiny.bin" "$work/models/ggml-tiny.bin.sha256"
-"$wm" download tiny >/dev/null
-out=$("$wm" update tiny)
+"$wm" download tiny >/dev/null 2>&1
+out=$("$wm" update tiny 2>&1)
 assert_contains "update is a no-op when unchanged" "$out" "up to date"
 
 # Move the remote, then confirm update notices and refetches. This is the whole
 # point of the wrapper, and upstream's script cannot do it at all.
 printf 'tiny model payload v2 which is longer' > "$work/blobs/ggml-tiny.bin"
-out=$("$wm" update tiny)
+out=$("$wm" update tiny 2>&1)
 assert_contains "update refetches a changed model" "$out" "updating"
 assert_equals "updated content landed" \
     "$(cat "$work/models/ggml-tiny.bin")" "tiny model payload v2 which is longer"
@@ -193,16 +197,16 @@ assert_contains "sidecar was rewritten" \
     "$(cat "$work/models/ggml-tiny.bin.sha256")" "sha256=$new_sha"
 
 # A bare update covers every installed model.
-"$wm" download silero-v6.2.0 >/dev/null
+"$wm" download silero-v6.2.0 >/dev/null 2>&1
 printf 'silero payload v2' > "$work/blobs/ggml-silero-v6.2.0.bin"
-out=$("$wm" update)
+out=$("$wm" update 2>&1)
 assert_contains "bare update reaches the vad family" "$out" "silero-v6.2.0"
 assert_equals "bare update refetched it" \
     "$(cat "$work/models/ggml-silero-v6.2.0.bin")" "silero payload v2"
 
 # A missing sidecar must self-heal by rehashing rather than failing.
 rm -f "$work/models/ggml-tiny.bin.sha256"
-status=0; out=$("$wm" update tiny) || status=$?
+status=0; out=$("$wm" update tiny 2>&1) || status=$?
 report "update survives a missing sidecar" 0 "$status"
 assert_contains "missing sidecar is recreated" \
     "$(cat "$work/models/ggml-tiny.bin.sha256")" "sha256="
@@ -214,14 +218,150 @@ assert_equals "remove deletes the model" \
 assert_equals "remove deletes the sidecar" \
     "$(ls "$work/models" | grep -c '^ggml-tiny.bin.sha256$' || true)" "0"
 
-# An unknown identifier must be refused rather than producing a 404 file.
-status=0; "$wm" download not-a-real-model >/dev/null 2>&1 || status=$?
+# An unknown identifier must be refused rather than producing a 404 file, and
+# with a clean error message. resolve_url's failure must stop cmd_download
+# before fetch ever runs curl on an empty URL, so no raw curl error appears.
+status=0; err=$("$wm" download not-a-real-model 2>&1 >/dev/null) || status=$?
 report "an unknown model is refused" 1 "$status"
+assert_contains "unknown model error is clear" "$err" "unknown model"
+assert_equals "no raw curl error leaked" \
+    "$(printf '%s\n' "$err" | grep -c 'curl:' || true)" "0"
 assert_equals "nothing was written for it" \
     "$(find "$work/models" -name '*not-a-real-model*' | wc -l)" "0"
+
+# update of a model that is not installed must fail rather than reporting
+# success for work it silently skipped.
+status=0; "$wm" update some-typo >/dev/null 2>&1 || status=$?
+report "update of an uninstalled model reports failure" 1 "$status"
 
 # No subcommand at all should print usage and fail, not succeed silently.
 status=0; "$wm" >/dev/null 2>&1 || status=$?
 report "no subcommand exits non-zero" 2 "$status"
+
+# A second stub, independent of the one above, whose repository listing can
+# go dark for one family and whose blob route can advertise a checksum that
+# disagrees with the bytes it actually serves. Both are read from the
+# environment so the handler stays a straight copy of the one above rather
+# than diverging logic that could itself hide a bug.
+cat > "$work/stub2.py" <<'PYEOF'
+import hashlib, http.server, json, os, sys
+
+ROOT = sys.argv[1]
+DEAD_REPO = os.environ.get("STUB_DEAD_REPO", "")
+BAD_ETAG_FILE = os.environ.get("STUB_BAD_ETAG_FILE", "")
+
+REPOS = {
+    "ggerganov/whisper.cpp": ["ggml-tiny.bin", "ggml-base.en.bin"],
+    "ggml-org/parakeet-GGUF": ["ggml-parakeet-tdt-0.6b-v3-f16.bin"],
+    "ggml-org/whisper-vad": ["ggml-silero-v6.2.0.bin"],
+    "akashmjn/tinydiarize-whisper.cpp": ["ggml-small.en-tdrz.bin"],
+}
+
+def payload(name):
+    with open(os.path.join(ROOT, name), "rb") as fh:
+        return fh.read()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _route(self):
+        path = self.path
+        if path.startswith("/api/models/"):
+            repo = path[len("/api/models/"):]
+            if repo not in REPOS or repo == DEAD_REPO:
+                return None
+            body = json.dumps(
+                {"siblings": [{"rfilename": f} for f in REPOS[repo]]}
+            ).encode()
+            return ("json", body, None)
+        # /<owner>/<name>/resolve/main/<file>
+        parts = path.lstrip("/").split("/")
+        if len(parts) == 5 and parts[2] == "resolve" and parts[3] == "main":
+            name = parts[4]
+            if not os.path.exists(os.path.join(ROOT, name)):
+                return None
+            data = payload(name)
+            sha = hashlib.sha256(data).hexdigest()
+            if name == BAD_ETAG_FILE:
+                sha = "0" * 64
+            return ("blob", data, sha)
+        return None
+
+    def do_HEAD(self):
+        r = self._route()
+        if r is None:
+            self.send_error(404)
+            return
+        kind, body, sha = r
+        self.send_response(200)
+        if kind == "blob":
+            self.send_header("X-Linked-ETag", '"%s"' % sha)
+            self.send_header("X-Linked-Size", str(len(body)))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
+    def do_GET(self):
+        r = self._route()
+        if r is None:
+            self.send_error(404)
+            return
+        kind, body, sha = r
+        self.send_response(200)
+        if kind == "blob":
+            self.send_header("X-Linked-ETag", '"%s"' % sha)
+            self.send_header("X-Linked-Size", str(len(body)))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[2])), Handler).serve_forever()
+PYEOF
+
+mkdir -p "$work/edge-blobs"
+printf 'tiny model payload v1' > "$work/edge-blobs/ggml-tiny.bin"
+printf 'base.en model payload' > "$work/edge-blobs/ggml-base.en.bin"
+printf 'parakeet payload'      > "$work/edge-blobs/ggml-parakeet-tdt-0.6b-v3-f16.bin"
+printf 'silero payload'        > "$work/edge-blobs/ggml-silero-v6.2.0.bin"
+printf 'tdrz payload'          > "$work/edge-blobs/ggml-small.en-tdrz.bin"
+
+port2=8732
+STUB_DEAD_REPO="akashmjn/tinydiarize-whisper.cpp" \
+STUB_BAD_ETAG_FILE="ggml-tiny.bin" \
+    python3 "$work/stub2.py" "$work/edge-blobs" "$port2" &
+srv2=$!
+
+for _ in $(seq 1 50); do
+    curl -fsS "http://127.0.0.1:$port2/api/models/ggml-org/whisper-vad" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+
+export WHISPER_HF_ENDPOINT="http://127.0.0.1:$port2"
+export WHISPER_MODEL_DIR="$work/edge-models"
+
+# One dead repository (tdrz, the personal repository plausibly dormant since
+# 2023) must not disable list for the three repositories that still answer.
+out=$("$wm" list)
+assert_contains "list survives a dead repository: whisper"  "$out" "tiny"
+assert_contains "list survives a dead repository: parakeet" "$out" "parakeet-tdt-0.6b-v3-f16"
+assert_contains "list survives a dead repository: vad"      "$out" "silero-v6.2.0"
+
+# A healthy family must still be downloadable while a different family's
+# repository is entirely dead.
+status=0; "$wm" download base.en >/dev/null 2>&1 || status=$?
+report "download from a healthy family survives a dead repository" 0 "$status"
+assert_equals "the healthy download landed" \
+    "$(cat "$work/edge-models/ggml-base.en.bin")" "base.en model payload"
+
+# A wrong X-Linked-ETag must be caught rather than installed, which is the
+# entire justification for fetch's verify-then-rename design: download the
+# real bytes, hash them locally, and refuse to keep anything that disagrees
+# with what the hub advertised.
+status=0; "$wm" download tiny >/dev/null 2>&1 || status=$?
+report "a bad advertised checksum is refused" 1 "$status"
+assert_equals "nothing was installed for the bad checksum" \
+    "$(find "$work/edge-models" -name 'ggml-tiny.bin' | wc -l)" "0"
+assert_equals "no .part left behind after a bad checksum" \
+    "$(find "$work/edge-models" -name '*.part' | wc -l)" "0"
 
 exit "$fail"
