@@ -68,6 +68,40 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # Runs the five suites that were previously local-only, so a regression cannot
+  # reach a release just because nobody ran them by hand. It runs alongside the
+  # build jobs rather than gating them, since the builds are cached and slow,
+  # and publish waits on both.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install the test dependencies
+        run: |
+          sudo apt-get update
+          # gcc builds the ABI stub the smoke test needs, ffmpeg and its ffprobe
+          # serve whisper-audio, and jq serves whisper-model.
+          sudo apt-get install -y --no-install-recommends \
+            gcc libc6-dev ffmpeg jq python3 dpkg-dev
+
+      - name: Run every suite
+        run: |
+          set -o pipefail
+          rc=0
+          for t in scripts/test/test-*.sh; do
+            echo "::group::$t"
+            if bash "$t"; then
+              echo "PASS $t"
+            else
+              echo "::error::$t failed"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$rc"
+
   build-base:
     needs: check
     if: needs.check.outputs.skip == 'false'
@@ -115,12 +149,22 @@ jobs:
           if-no-files-found: error
 
   build-vulkan:
-    needs: check
+    needs: [check, build-base]
     if: needs.check.outputs.skip == 'false'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout the packaging scripts
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Reuse the base package build-base already made rather than fetching the
+      # archive and rebuilding it here. Three copies of that logic is what
+      # produced the missing-output-directory bug, which build-base could not
+      # hit and the two backend jobs both could.
+      - name: Download the base package
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: debs-base
+          path: basedist
 
       - name: Install the Vulkan SDK
         run: |
@@ -192,21 +236,30 @@ jobs:
             *) echo "::error::backend floor $floor exceeds the base package's GLIBC_2.34"; exit 1 ;;
           esac
 
-      - name: Build the packages and smoke test them
+      # The same guard build-cuda runs, for the same reason. The LunarG SDK is
+      # installed on this runner, so a backend that picked up a shaderc or
+      # SPIRV-Tools link would resolve here and pass ldd -r in the smoke test,
+      # then fail to dlopen on a user's machine and fall back to CPU silently.
+      - name: Check the backend links only declared Vulkan libraries
+        run: scripts/check-backend-deps.sh "${{ steps.backend.outputs.path }}" vulkan
+
+      - name: Build the package and smoke test it
         env:
-          TAG: ${{ needs.check.outputs.tag }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           mkdir -p dist
-          archive="whisper-bin-ubuntu-x64.tar.gz"
-          curl -fsSL -o "$archive" \
-            "https://github.com/ggml-org/whisper.cpp/releases/download/${TAG}/${archive}"
-          scripts/package-base.sh "$archive" "$VERSION" amd64 "$PWD/basedist"
           scripts/package-vulkan.sh "${{ steps.backend.outputs.path }}" "$VERSION" dist
           # whisper.cpp is already checked out at the right tag, so point the
           # smoke test at its own sample. curl needs the file:// scheme, since a
           # bare path is parsed as a hostname.
+          #
+          # EXPECT_BACKEND is the assertion that matters here. The transcription
+          # alone passes identically on CPU, so without it this job would go
+          # green whether lavapipe ran the work or Vulkan silently declined to
+          # load. mesa-vulkan-drivers gives this runner a real software device,
+          # so demanding it is fair.
           SAMPLE_URL="file://$PWD/whisper.cpp/samples/jfk.wav" \
+          EXPECT_BACKEND=Vulkan \
             scripts/smoke-test.sh \
               "basedist/whisper-cpp_${VERSION}_amd64.deb" \
               "dist/whisper-cpp-vulkan_${VERSION}_amd64.deb"
@@ -226,7 +279,7 @@ jobs:
   # container all CUDA libraries resolve, so a remaining undefined symbol means
   # a genuine disagreement with upstream's prebuilt libggml-base.
   build-cuda:
-    needs: check
+    needs: [check, build-base]
     if: needs.check.outputs.skip == 'false'
     runs-on: ubuntu-latest
     container: nvidia/cuda:13.3.1-devel-ubuntu22.04
@@ -318,19 +371,23 @@ jobs:
           df -h /
 
       - name: Check the backend links only declared CUDA libraries
-        run: scripts/check-backend-deps.sh "${{ steps.backend.outputs.path }}"
+        run: scripts/check-backend-deps.sh "${{ steps.backend.outputs.path }}" cuda
 
-      - name: Build the packages and smoke test them
+      # Reuse build-base's package rather than rebuilding it here, as the Vulkan
+      # job does. Three copies of that logic produced the missing-output-
+      # directory bug that build-base could not hit and both backend jobs could.
+      - name: Download the base package
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: debs-base
+          path: basedist
+
+      - name: Build the package and smoke test it
         env:
-          TAG: ${{ needs.check.outputs.tag }}
           VERSION: ${{ needs.check.outputs.version }}
           CUDA_SUFFIX: ${{ steps.toolchain.outputs.cuda_suffix }}
         run: |
           mkdir -p dist
-          archive="whisper-bin-ubuntu-x64.tar.gz"
-          curl -fsSL -o "$archive" \
-            "https://github.com/ggml-org/whisper.cpp/releases/download/${TAG}/${archive}"
-          scripts/package-base.sh "$archive" "$VERSION" amd64 "$PWD/basedist"
           scripts/package-cuda.sh \
             "${{ steps.backend.outputs.path }}" "$VERSION" "$CUDA_SUFFIX" dist
           echo "--- CUDA package dependencies ---"
@@ -357,7 +414,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [check, build-base, build-vulkan, build-cuda]
+    needs: [check, test, build-base, build-vulkan, build-cuda]
     if: needs.check.outputs.skip == 'false'
     runs-on: ubuntu-latest
     permissions:
@@ -380,15 +437,23 @@ jobs:
           ls -la dist
           # -R is required: this job does not check out the repository, and
           # without a git remote gh cannot infer which repository to act on.
-          # A forced rebuild reuses the upstream tag, and gh refuses to create a
-          # release that already exists, so replace it rather than failing.
+          #
+          # A forced rebuild reuses the upstream tag. Deleting the existing
+          # release first would leave a window, roughly 65 MB of upload long, in
+          # which a failure loses both the old release and the new one, and
+          # removes the tag with them. Uploading over it with --clobber has no
+          # such window.
           if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
-            echo "Replacing the existing release for $TAG"
-            gh release delete "$TAG" -R "$REPO" --yes --cleanup-tag
+            echo "Updating the existing release for $TAG in place"
+            gh release upload "$TAG" dist/*.deb -R "$REPO" --clobber
+            gh release edit "$TAG" -R "$REPO" \
+              --title "whisper.cpp $TAG" \
+              --notes "Debian packages built from ggml-org/whisper.cpp $TAG (version $VERSION)."
+          else
+            gh release create "$TAG" dist/*.deb -R "$REPO" \
+              --title "whisper.cpp $TAG" \
+              --notes "Debian packages built from ggml-org/whisper.cpp $TAG (version $VERSION)."
           fi
-          gh release create "$TAG" dist/*.deb -R "$REPO" \
-            --title "whisper.cpp $TAG" \
-            --notes "Debian packages built from ggml-org/whisper.cpp $TAG (version $VERSION)."
 
       - name: Dispatch to the APT repository
         env:

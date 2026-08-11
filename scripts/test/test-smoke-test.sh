@@ -33,9 +33,16 @@ curl -fsSL -o "$work/base.tar.gz" \
 base=$("$here/../package-base.sh" "$work/base.tar.gz" "$version" amd64 "$work")
 
 # libgomp1 is absent from a clean trixie, and the tools need it on the path.
-( cd "$work" && apt-get download libgomp1 >/dev/null 2>&1 )
+# stderr is kept: a mirror outage or stale apt cache would otherwise abort the
+# suite under set -e with nothing printed at all. The library directory is
+# derived from dpkg rather than hardcoded, so this also runs on an arm64 host.
+if ! ( cd "$work" && apt-get download libgomp1 >/dev/null ); then
+    echo "FAIL  could not fetch libgomp1, which the shipped binaries need" >&2
+    exit 1
+fi
 dpkg-deb -x "$work"/libgomp1_*.deb "$work/gomp"
-export BACKEND_STUB_DIR="$work/gomp/usr/lib/x86_64-linux-gnu"
+multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)
+export BACKEND_STUB_DIR="$work/gomp/usr/lib/$multiarch"
 
 # One shared model directory across all three invocations below. Without this
 # each run downloads ggml-tiny.en.bin again, roughly 78 MB a time.
@@ -103,6 +110,35 @@ contains "the missing-library branch fires" "$out" \
     "the backend is missing a library"
 contains "the undefined-symbol branch fires" "$out" \
     "the backend has undefined symbols against the base package"
+
+# A backend package that lands nothing in the tree must fail rather than pass
+# silently. Without this check the loop simply finds no backend, skips, and the
+# transcription alone carries the job, so a package shipping the wrong path
+# would go green.
+mkdir -p "$work/empty/DEBIAN" "$work/empty/usr/lib/whisper.cpp"
+chmod 0755 "$work/empty/DEBIAN"
+cat > "$work/empty/DEBIAN/control" <<CTLEOF
+Package: whisper-cpp-vulkan
+Version: ${version}
+Architecture: amd64
+Maintainer: li-ruijie <1547237+li-ruijie@users.noreply.github.com>
+Section: misc
+Priority: optional
+Description: a backend package that ships no backend
+CTLEOF
+dpkg-deb --root-owner-group --build "$work/empty" "$work/empty.deb" >/dev/null
+status=0
+out=$("$here/../smoke-test.sh" "$base" "$work/empty.deb" 2>&1) || status=$?
+report "a backend package shipping no backend is rejected" 1 "$status"
+contains "it says no backend landed" "$out" "no backend landed"
+
+# EXPECT_BACKEND must actually be able to fail, otherwise setting it in CI
+# proves nothing. There is no GPU here, so whisper falls back to CPU and a
+# demand for a Vulkan backend has to be refused.
+status=0
+out=$(EXPECT_BACKEND=Vulkan "$here/../smoke-test.sh" "$base" 2>&1) || status=$?
+report "an unmet EXPECT_BACKEND fails" 1 "$status"
+contains "it names the fallback" "$out" "fell back to CPU"
 
 # Argument validation.
 status=0; "$here/../smoke-test.sh" >/dev/null 2>&1 || status=$?
