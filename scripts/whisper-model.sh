@@ -37,25 +37,33 @@ if [ -n "${HF_TOKEN:-}" ]; then
 fi
 
 # Every model the hub currently serves, as "<family> <id> <url>" lines. A
-# here-document rather than a pipeline, so a failure here exits the script
-# instead of a subshell.
+# here-document rather than a pipeline keeps the per-repository success count
+# below out of a subshell, so it survives past the loop. A repository that
+# fails to answer, whether dormant, renamed, or offline, is warned about on
+# stderr and skipped rather than aborting the whole call. Only failure across
+# every repository is treated as fatal.
 hub_index() {
     need curl
     need jq
-    local family repo
+    local family repo ok=0
     while IFS=: read -r family repo; do
         [ -n "$family" ] || continue
-        curl -fsSL "${auth[@]}" "$HF/api/models/$repo" \
+        if curl -fsSL "${auth[@]}" "$HF/api/models/$repo" \
             | jq -r --arg fam "$family" --arg base "$HF/$repo/resolve/main" '
                 .siblings[].rfilename
                 | select(test("^ggml-.*\\.bin$"))
                 | . as $file
                 | "\($fam) \($file | sub("^ggml-";"") | sub("\\.bin$";"")) \($base)/\($file)"
-              ' \
-            || die "could not read the model list for $repo"
+              '
+        then
+            ok=$((ok + 1))
+        else
+            printf 'warning: could not read the model list for %s, skipping\n' "$repo" >&2
+        fi
     done <<EOF
 $SOURCES
 EOF
+    [ "$ok" -gt 0 ] || die "could not reach any of the model repositories"
 }
 
 resolve_url() {  # resolve_url <id>
@@ -169,14 +177,15 @@ cmd_list() {
 
 cmd_download() {
     [ "$#" -ge 1 ] || die "usage: $self download <model>..." 2
-    local id
+    local id url
     for id in "$@"; do
-        fetch "$id" "$(resolve_url "$id")"
+        url=$(resolve_url "$id")
+        fetch "$id" "$url"
     done
 }
 
 cmd_update() {
-    local ids id dir file side url want want_size have
+    local ids id dir file side url want want_size have status=0
     dir=$(model_dir)
     if [ "$#" -ge 1 ]; then
         ids=$(printf '%s\n' "$@")
@@ -190,6 +199,7 @@ cmd_update() {
         side="$file.sha256"
         if [ ! -f "$file" ]; then
             printf '%s: not installed, skipping\n' "$id" >&2
+            status=1
             continue
         fi
 
@@ -198,7 +208,11 @@ cmd_update() {
         have=$(sidecar_field "$side" sha256)
         [ -n "$have" ] || have=$(local_sha "$file")
 
-        want=$(head_meta "$url")
+        want=$(head_meta "$url") || {
+            printf '%s: could not reach the hub, skipping\n' "$id" >&2
+            status=1
+            continue
+        }
         want_size=${want##* }
         want=${want%% *}
 
@@ -219,6 +233,7 @@ cmd_update() {
             fetch "$id" "$url"
         fi
     done
+    return "$status"
 }
 
 cmd_remove() {
