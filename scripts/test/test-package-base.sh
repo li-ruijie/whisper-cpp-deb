@@ -109,4 +109,14 @@ assert_contains "binary runs from its real path" "$direct" "usage:"
 viasym=$(LD_LIBRARY_PATH="$gomp" "$work/root/usr/bin/whisper-cli" --help 2>&1 || true)
 assert_contains "binary runs through the symlink" "$viasym" "usage:"
 
+assert_contains "wrapper shipped" "$contents" "./usr/bin/whisper-model"
+
+# It must be a real file rather than a symlink into the payload directory.
+assert_equals "wrapper is not a symlink" \
+    "$(printf '%s\n' "$contents" | grep -c './usr/bin/whisper-model ->' || true)" "0"
+
+wrapper_usage=$("$work/root/usr/bin/whisper-model" --help 2>&1 || true)
+assert_contains "wrapper runs from the package" "$wrapper_usage" "whisper-model <command>"
+assert_contains "wrapper documents update" "$wrapper_usage" "update"
+
 exit "$fail"

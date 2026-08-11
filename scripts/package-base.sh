@@ -81,10 +81,12 @@ done
 find "$libdir" -name '*.so*' -type f -exec chmod 644 {} +
 
 # The model wrapper is a real file rather than a symlink, since it is ours
-# rather than upstream's. Task 3 creates it; tolerate its absence until then.
-if [ -f "$here/whisper-model.sh" ]; then
-    install -Dm755 "$here/whisper-model.sh" "$root/usr/bin/whisper-model"
+# rather than upstream's.
+if [ ! -f "$here/whisper-model.sh" ]; then
+    echo "$0: whisper-model.sh is missing from $here" >&2
+    exit 1
 fi
+install -Dm755 "$here/whisper-model.sh" "$root/usr/bin/whisper-model"
 
 cat > "$root/DEBIAN/control" <<EOF
 Package: whisper-cpp
