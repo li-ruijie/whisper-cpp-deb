@@ -93,7 +93,10 @@ installed_ids() {
 # the header, which the callers degrade on rather than fail.
 head_meta() {  # head_meta <url>
     local hdrs sha size
-    hdrs=$(curl -fsSIL "${auth[@]}" "$1") || die "could not reach $1"
+    hdrs=$(curl -fsSIL "${auth[@]}" "$1") || {
+        printf '%s: %s\n' "$self" "could not reach $1" >&2
+        return 1
+    }
     hdrs=$(printf '%s\n' "$hdrs" | tr -d '\r')
     sha=$(printf '%s\n' "$hdrs" \
         | sed -n 's/^[Xx]-[Ll]inked-[Ee][Tt][Aa][Gg]: *"\(.*\)"$/\1/p' | head -1)
@@ -146,13 +149,25 @@ fetch() {  # fetch <id> <url>
             printf '%s: %s\n' "$self" "checksum mismatch for $id (expected $sha, got $actual)" >&2
             return 1
         fi
-    else
+    elif [ -n "$size" ]; then
+        # The hub sent no checksum but did send a length, so this is the one
+        # case where a weaker check is acceptable rather than an outright
+        # refusal. The warning only fires here, where a check actually runs.
         printf 'warning: the hub sent no X-Linked-ETag for %s, checking size only\n' "$id" >&2
-        if [ -n "$size" ] && [ "$(stat -c%s "$part")" != "$size" ]; then
+        if [ "$(stat -c%s "$part")" != "$size" ]; then
             rm -f "$part"
             printf '%s: %s\n' "$self" "size mismatch for $id" >&2
             return 1
         fi
+    else
+        # Neither header came back, so nothing verifies this download at all.
+        # Installing it anyway would record a sidecar hash computed from the
+        # file itself, which a later verify would then always agree with.
+        # Refuse instead of accepting an unverifiable file.
+        rm -f "$part"
+        printf '%s: %s\n' "$self" \
+            "no verification possible for $id (the hub sent neither X-Linked-ETag nor X-Linked-Size)" >&2
+        return 1
     fi
 
     mv -f "$part" "$file"
