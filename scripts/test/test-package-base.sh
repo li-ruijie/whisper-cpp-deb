@@ -117,6 +117,20 @@ assert_equals "wrapper is not a symlink" \
 
 wrapper_usage=$("$work/root/usr/bin/whisper-model" --help 2>&1 || true)
 assert_contains "wrapper runs from the package" "$wrapper_usage" "whisper-model <command>"
-assert_contains "wrapper documents update" "$wrapper_usage" "update"
+assert_contains "wrapper documents update" "$wrapper_usage" "update [<model>...]"
+
+assert_contains "audio wrapper shipped" "$contents" "./usr/bin/whisper-audio"
+assert_equals "audio wrapper is not a symlink" \
+    "$(printf '%s\n' "$contents" | grep -c './usr/bin/whisper-audio ->' || true)" "0"
+
+# ffmpeg is recommended rather than depended on, so a --no-install-recommends
+# machine still gets a working whisper-cli for the four formats it reads
+# natively. A hard dependency here would be a defect, not a nicety.
+assert_contains "ffmpeg is recommended" "$control" "Recommends: ffmpeg"
+assert_equals "ffmpeg is absent from Depends" \
+    "$(printf '%s\n' "$depends" | grep -c 'ffmpeg' || true)" "0"
+
+audio_usage=$("$work/root/usr/bin/whisper-audio" -h 2>&1 || true)
+assert_contains "audio wrapper runs from the package" "$audio_usage" "whisper-audio [-f]"
 
 exit "$fail"

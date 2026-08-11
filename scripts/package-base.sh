@@ -88,6 +88,13 @@ if [ ! -f "$here/whisper-model.sh" ]; then
 fi
 install -Dm755 "$here/whisper-model.sh" "$root/usr/bin/whisper-model"
 
+# The audio wrapper, likewise ours rather than upstream's.
+if [ ! -f "$here/whisper-audio.sh" ]; then
+    echo "$0: whisper-audio.sh is missing from $here" >&2
+    exit 1
+fi
+install -Dm755 "$here/whisper-audio.sh" "$root/usr/bin/whisper-audio"
+
 cat > "$root/DEBIAN/control" <<EOF
 Package: whisper-cpp
 Version: ${version}
@@ -95,6 +102,7 @@ Architecture: ${arch}
 Maintainer: li-ruijie <1547237+li-ruijie@users.noreply.github.com>
 Homepage: https://github.com/ggml-org/whisper.cpp
 Depends: libc6 (>= 2.34), libgcc-s1, libgomp1, libstdc++6 (>= 12), curl, jq
+Recommends: ffmpeg
 Conflicts: whisper.cpp-tools
 Section: misc
 Priority: optional
@@ -105,6 +113,12 @@ Description: whisper.cpp, speech recognition in C/C++
  .
  whisper-model downloads and updates the ggml model files these tools need,
  covering the whisper, parakeet, VAD, and tinydiarize model families.
+ .
+ whisper-audio converts any file ffmpeg can read into the 16 kHz mono PCM WAV
+ whisper.cpp uses internally. whisper-cli itself reads only flac, mp3, ogg,
+ and wav, so m4a, opus, and video containers need converting first. ffmpeg is
+ recommended rather than depended on, since the four native formats work
+ without it.
  .
  Install whisper-cpp-cuda or whisper-cpp-vulkan alongside this package to add
  GPU acceleration. Both may be installed together, in which case CUDA is
