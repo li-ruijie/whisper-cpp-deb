@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Upstream tag override, for example v1.9.2. Empty means latest."
+        description: "Semantic tag override, for example v1.9.2. Empty means the newest one."
         required: false
         type: string
       force:
@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
+      asset_tag: ${{ steps.resolve.outputs.asset_tag }}
       version: ${{ steps.resolve.outputs.version }}
       skip: ${{ steps.resolve.outputs.skip }}
     steps:
@@ -43,14 +44,59 @@ jobs:
           if [ -n "$VERSION_OVERRIDE" ]; then
             TAG="$VERSION_OVERRIDE"
           else
-            # Authenticated, because the anonymous API allows 60 requests an hour
-            # per IP and runners share addresses, which returns 403 in practice.
-            TAG=$(gh api repos/ggml-org/whisper.cpp/releases/latest --jq '.tag_name')
+            # Deliberately not releases/latest. From v1.9.3 upstream cuts the
+            # semantic release as a prerelease and publishes the binaries on a
+            # b<N> nightly instead, so latest returns the nightly, whose tag is
+            # no version at all. Take the newest semantic tag and read the
+            # binaries off whichever release actually carries them, below.
+            #
+            # One page suffices. Upstream has published 40 releases in all,
+            # and even at a nightly a day a semantic tag lands every fortnight
+            # or so, well inside 100. Authenticated, because the anonymous API
+            # allows 60 requests an hour per IP and runners share addresses,
+            # returning 403 in practice.
+            TAG=$(gh api 'repos/ggml-org/whisper.cpp/releases?per_page=100' \
+              --jq '[.[] | select(.tag_name | test("^v[0-9]"))] | first | .tag_name')
           fi
 
-          # Upstream tags are semantic versions prefixed with v.
           VERSION="${TAG#v}"
+
+          # Guards the override, the resolver above being unable to return
+          # anything else. A b<N> tag would otherwise reach package-base.sh a
+          # job later and be rejected there, having already downloaded 65 MB.
+          case "$VERSION" in
+            [0-9]*) ;;
+            *) echo "::error::$TAG is not a semantic tag, so $VERSION is not a Debian version"
+               exit 1 ;;
+          esac
+
+          # Every release up to v1.9.2 carried its own archives, and from v1.9.3
+          # they sit on the nightly cut from the same commit, so prefer the
+          # semantic release and fall back to that nightly. Matching on the
+          # commit rather than on publication order, since a nightly for an
+          # entirely different commit is worse than no build at all.
+          if gh api "repos/ggml-org/whisper.cpp/releases/tags/$TAG" \
+               --jq '.assets[].name' | grep -qx 'whisper-bin-ubuntu-x64.tar.gz'; then
+            ASSET_TAG="$TAG"
+          else
+            SHA=$(gh api "repos/ggml-org/whisper.cpp/commits/$TAG" --jq '.sha')
+            ASSET_TAG=""
+            for cand in $(gh api 'repos/ggml-org/whisper.cpp/releases?per_page=100' \
+                            --jq '.[] | select(.tag_name | test("^b[0-9]+$")) | .tag_name'); do
+              if [ "$(gh api "repos/ggml-org/whisper.cpp/commits/$cand" --jq '.sha')" = "$SHA" ]; then
+                ASSET_TAG="$cand"
+                break
+              fi
+            done
+            if [ -z "$ASSET_TAG" ]; then
+              echo "::error::no release carries the archives for $TAG, at commit $SHA"
+              exit 1
+            fi
+          fi
+
+          echo "Upstream $TAG, version $VERSION, archives from $ASSET_TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset_tag=$ASSET_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           DEPLOYED=$(curl -fsSL \
@@ -112,7 +158,9 @@ jobs:
 
       - name: Build the base packages
         env:
-          TAG: ${{ needs.check.outputs.tag }}
+          # The release holding the archives, which since v1.9.3 is the nightly
+          # rather than the semantic tag the packages are versioned after.
+          ASSET_TAG: ${{ needs.check.outputs.asset_tag }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           mkdir -p dist
@@ -121,7 +169,7 @@ jobs:
             debarch="${pair##*:}"
             archive="whisper-bin-ubuntu-${upstream}.tar.gz"
             curl -fsSL -o "$archive" \
-              "https://github.com/ggml-org/whisper.cpp/releases/download/${TAG}/${archive}"
+              "https://github.com/ggml-org/whisper.cpp/releases/download/${ASSET_TAG}/${archive}"
             scripts/package-base.sh "$archive" "$VERSION" "$debarch" dist
           done
           ls -la dist
