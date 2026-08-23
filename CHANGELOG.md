@@ -3,6 +3,14 @@
 ┌────────────┬────────────────────────────────────────────────────────────────────────────────────┐
 │ Date       │ Summary                                                                            │
 ├────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+│ 2026-08-23 │ Upstream split its release scheme on 2026-08-20, cutting v1.9.3 as a prerelease    │
+│            │ carrying no binaries and publishing the archives on the b4938 nightly from the     │
+│            │ same commit. releases/latest therefore returned a tag Debian cannot version, and   │
+│            │ the 2026-08-23 build failed in build-base on the digit guard in package-base.sh.   │
+│            │ check now resolves the newest semantic tag for the version and finds the release   │
+│            │ carrying the archives by matching commits, so packages stay on 1.9.3 and upgrade   │
+│            │ cleanly from 1.9.2. A non-semantic override is rejected in check rather than a     │
+│            │ job later, after 65 MB has already been fetched                                    │
 │ 2026-08-11 │ Acted on a whole-branch review. The test suites now run in CI, 186 assertions      │
 │            │ across seven of them, where they had been local-only and run by hand, which is     │
 │            │ why a missing mkdir in package-base.sh reached CI at all. Two things believed to   │
