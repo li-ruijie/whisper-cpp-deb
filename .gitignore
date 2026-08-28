@@ -3,6 +3,7 @@
 .claude/
 .devcontainer/
 AGENTS.md
+CHANGELOG.md
 
 # Vim
 *.swo
