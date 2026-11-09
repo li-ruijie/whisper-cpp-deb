@@ -38,7 +38,9 @@ assert_equals() {  # assert_equals <label> <actual> <expected>
     fi
 }
 
-curl -fsSL -o "$work/base.tar.gz" \
+# The release CDN returns an occasional 504, which failed the 2026-11-08 run.
+# Retrying every error also covers a connection dropped mid-transfer.
+curl -fsSL --retry 3 --retry-all-errors -o "$work/base.tar.gz" \
     "https://github.com/ggml-org/whisper.cpp/releases/download/${tag}/whisper-bin-ubuntu-x64.tar.gz"
 
 # Capture stdout. The script's documented contract is that it prints the path it
