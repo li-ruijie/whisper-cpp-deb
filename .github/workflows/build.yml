@@ -17,6 +17,10 @@ on:
         required: false
         default: false
         type: boolean
+      revision:
+        description: "Packaging revision, for example 1 to ship 1.9.5-1. Empty means none."
+        required: false
+        type: string
 
 permissions: {}
 
@@ -31,13 +35,18 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       asset_tag: ${{ steps.resolve.outputs.asset_tag }}
       version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
       skip: ${{ steps.resolve.outputs.skip }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Resolve the upstream tag and decide whether to build
         id: resolve
         env:
           VERSION_OVERRIDE: ${{ inputs.version }}
           FORCE: ${{ inputs.force }}
+          REVISION: ${{ inputs.revision }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
@@ -59,16 +68,10 @@ jobs:
               --jq '[.[] | select(.tag_name | test("^v[0-9]"))] | first | .tag_name')
           fi
 
-          VERSION="${TAG#v}"
-
           # Guards the override, the resolver above being unable to return
-          # anything else. A b<N> tag would otherwise reach package-base.sh a
-          # job later and be rejected there, having already downloaded 65 MB.
-          case "$VERSION" in
-            [0-9]*) ;;
-            *) echo "::error::$TAG is not a semantic tag, so $VERSION is not a Debian version"
-               exit 1 ;;
-          esac
+          # anything else, and the revision. decide-build.sh repeats both
+          # checks below, run here as well so that nothing is fetched first.
+          scripts/decide-build.sh "$TAG" "$REVISION" "" false > /dev/null
 
           # Every release up to v1.9.2 carried its own archives, and from v1.9.3
           # they sit on the nightly cut from the same commit, so prefer the
@@ -94,25 +97,19 @@ jobs:
             fi
           fi
 
-          echo "Upstream $TAG, version $VERSION, archives from $ASSET_TAG"
+          echo "Upstream $TAG, archives from $ASSET_TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "asset_tag=$ASSET_TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           DEPLOYED=$(curl -fsSL \
             https://li-ruijie.github.io/apt/dists/stable/dynamic/binary-amd64/Packages 2>/dev/null \
             | awk '/^Package: whisper-cpp$/,/^$/' | grep '^Version:' | awk '{print $2}' || true)
 
-          if [ "$VERSION" = "$DEPLOYED" ] && [ "$FORCE" != "true" ]; then
-            echo "Version $VERSION already deployed, skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          elif [ "$VERSION" = "$DEPLOYED" ]; then
-            echo "Rebuilding $VERSION (forced)"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "New version $VERSION (deployed: ${DEPLOYED:-none})"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          # Captured before it is written, so a refusal leaves no partial
+          # output behind for a later job to read.
+          decision=$(scripts/decide-build.sh "$TAG" "$REVISION" "$DEPLOYED" "$FORCE")
+          echo "$decision"
+          echo "$decision" >> "$GITHUB_OUTPUT"
 
   # Runs the five suites that were previously local-only, so a regression cannot
   # reach a release just because nobody ran them by hand. It runs alongside the
@@ -505,7 +502,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          TAG: ${{ needs.check.outputs.tag }}
+          # Our release, which carries the revision where there is one, and
+          # the upstream tag the packages were built from.
+          TAG: ${{ needs.check.outputs.release_tag }}
+          UPSTREAM: ${{ needs.check.outputs.tag }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           ls -la dist
@@ -522,18 +522,18 @@ jobs:
             gh release upload "$TAG" dist/*.deb -R "$REPO" --clobber
             gh release edit "$TAG" -R "$REPO" \
               --title "whisper.cpp $TAG" \
-              --notes "Debian packages built from ggml-org/whisper.cpp $TAG (version $VERSION)."
+              --notes "Debian packages built from ggml-org/whisper.cpp $UPSTREAM (version $VERSION)."
           else
             gh release create "$TAG" dist/*.deb -R "$REPO" \
               --title "whisper.cpp $TAG" \
-              --notes "Debian packages built from ggml-org/whisper.cpp $TAG (version $VERSION)."
+              --notes "Debian packages built from ggml-org/whisper.cpp $UPSTREAM (version $VERSION)."
           fi
 
       - name: Dispatch to the APT repository
         env:
           GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ needs.check.outputs.tag }}
+          TAG: ${{ needs.check.outputs.release_tag }}
         run: |
           base="https://github.com/${REPO}/releases/download/${TAG}"
           urls=$(for f in dist/*.deb; do printf '"%s/%s",' "$base" "$(basename "$f")"; done)

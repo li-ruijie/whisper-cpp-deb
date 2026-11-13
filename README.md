@@ -55,10 +55,15 @@ Where either is missing, ggml skips the backend and whisper runs on CPU.
 
 ## Building
 
-The workflow runs weekly and can be dispatched manually with a `version` override and a
-`force` flag. The scripts run standalone:
+The workflow runs weekly and can be dispatched manually with a `version` override, a
+`force` flag, and a `revision`. A revision ships a packaging change against an unchanged
+upstream version, so `1` builds `1.9.5-1` under the release `v1.9.5-1`, which apt sorts above
+`1.9.5`. The weekly run passes none and skips an upstream version already deployed under any
+revision. A version apt would sort below the deployed one is refused. The scripts run
+standalone:
 
 ```sh
+scripts/decide-build.sh   <tag> <revision> <deployed> <force>
 scripts/package-base.sh   <tarball> <version> <arch> <outdir>
 scripts/package-cuda.sh   <libggml-cuda.so> <version> <cuda-suffix> <outdir>
 scripts/package-vulkan.sh <libggml-vulkan.so> <version> <outdir>
