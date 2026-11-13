@@ -16,8 +16,28 @@ trap '
     [ -n "${srv3:-}" ] && { kill "$srv3" 2>/dev/null || true; }
     [ -n "${srv4:-}" ] && { kill "$srv4" 2>/dev/null || true; }
     [ -n "${srv5:-}" ] && { kill "$srv5" 2>/dev/null || true; }
+    [ -n "${srv6:-}" ] && { kill "$srv6" 2>/dev/null || true; }
     true
 ' EXIT
+
+# whisper-model downloads with aria2c where it is installed and with curl
+# otherwise, and both paths are tested whatever this machine carries. A missing
+# aria2c fails the suite rather than skipping its half, so that the aria2c path
+# cannot stop being tested without anyone noticing.
+if ! command -v aria2c >/dev/null 2>&1; then
+    printf 'FAIL  aria2c is not installed, so its download path cannot be tested\n'
+    exit 1
+fi
+
+# Every executable this machine has except aria2c, which stands in for a
+# machine without it. Built from the directories rather than from a list of
+# the tools whisper-model calls, which would go stale silently.
+noaria="$work/noaria"
+mkdir -p "$noaria"
+for f in /usr/bin/* /bin/*; do
+    n=${f##*/}
+    [ "$n" = aria2c ] || [ -e "$noaria/$n" ] || ln -s "$f" "$noaria/$n"
+done
 
 # Bind to an ephemeral port and read back what the kernel gave us, rather than
 # hardcoding one. A collision on a fixed port produced five seconds of readiness
@@ -541,7 +561,8 @@ assert_equals "the model after an unknown one still landed" \
 # Resume is the reason the .part file exists, and a network failure is the case
 # it exists for. The download-failure path must therefore keep the partial
 # rather than delete it. A stub that closes the connection partway leaves a
-# short .part, which must survive for the next attempt to continue from.
+# short .part, which must survive for the next attempt to continue from. This
+# and the oversized case below are curl's behaviour, so both run without aria2c.
 cat > "$work/truncating.py" <<'PYEOF'
 import http.server, json, sys
 
@@ -601,7 +622,7 @@ rm -rf "$work/resume-models"; mkdir -p "$work/resume-models"
 export WHISPER_HF_ENDPOINT="http://127.0.0.1:$port5"
 export WHISPER_MODEL_DIR="$work/resume-models"
 
-status=0; "$wm" download trunc >/dev/null 2>&1 || status=$?
+status=0; PATH="$noaria" "$wm" download trunc >/dev/null 2>&1 || status=$?
 report "a truncated download fails" 1 "$status"
 assert_equals "no model file was installed" \
     "$(find "$work/resume-models" -name 'ggml-trunc.bin' | wc -l)" "0"
@@ -613,7 +634,216 @@ assert_equals "the partial holds the bytes that did arrive" \
 # An oversized partial must be discarded rather than sending an unsatisfiable
 # Range that no amount of retrying can fix.
 printf '%*s' 9000 '' > "$work/resume-models/ggml-trunc.bin.part"
-status=0; err=$("$wm" download trunc 2>&1) || status=$?
+status=0; err=$(PATH="$noaria" "$wm" download trunc 2>&1) || status=$?
 assert_contains "an oversized partial is discarded" "$err" "oversized partial"
+
+# A stub that honours Range, paces its body so that a download can be
+# interrupted partway, and logs the User-Agent of every GET, which is how these
+# tests tell an aria2c fetch from a curl one.
+cat > "$work/ranged.py" <<'PYEOF'
+import hashlib, http.server, json, os, re, sys, time
+
+ROOT, PORT, UA_LOG = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+LISTS = "/api/models/ggerganov/whisper.cpp"
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _blob(self):
+        path = os.path.join(ROOT, self.path.rsplit("/", 1)[-1])
+        if "/resolve/main/" not in self.path or not os.path.exists(path):
+            return None
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def _listing(self):
+        if self.path != LISTS:
+            self.send_error(404)
+            return
+        body = json.dumps(
+            {"siblings": [{"rfilename": f} for f in sorted(os.listdir(ROOT))]}
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command == "GET":
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        if self.path.startswith("/api/models/"):
+            return self._listing()
+        data = self._blob()
+        if data is None:
+            return self.send_error(404)
+        self.send_response(200)
+        self.send_header("X-Linked-ETag", '"%s"' % hashlib.sha256(data).hexdigest())
+        self.send_header("X-Linked-Size", str(len(data)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path.startswith("/api/models/"):
+            return self._listing()
+        data = self._blob()
+        if data is None:
+            return self.send_error(404)
+        with open(UA_LOG, "a") as fh:
+            fh.write(self.headers.get("User-Agent", "") + "\n")
+        start, end = 0, len(data) - 1
+        m = re.match(r"bytes=(\d+)-(\d*)$", self.headers.get("Range", ""))
+        if m:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else end
+            self.send_response(206)
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, len(data)))
+        else:
+            self.send_response(200)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.end_headers()
+        try:
+            for i in range(start, end + 1, 4096):
+                self.wfile.write(data[i:min(i + 4096, end + 1)])
+                time.sleep(0.005)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+PYEOF
+
+mkdir -p "$work/ranged-blobs" "$work/ranged-models"
+head -c 1048576 /dev/urandom > "$work/ranged-blobs/ggml-slow.bin"
+slow_sha=$(sha256sum "$work/ranged-blobs/ggml-slow.bin" | cut -d' ' -f1)
+ua_log="$work/ua.log"
+: > "$ua_log"
+
+port6=$(free_port)
+python3 "$work/ranged.py" "$work/ranged-blobs" "$port6" "$ua_log" &
+srv6=$!
+for _ in $(seq 1 50); do
+    curl -fsS "http://127.0.0.1:$port6/api/models/ggerganov/whisper.cpp" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+
+export WHISPER_HF_ENDPOINT="http://127.0.0.1:$port6"
+export WHISPER_MODEL_DIR="$work/ranged-models"
+slow="$work/ranged-models/ggml-slow.bin"
+
+slow_reset() {  # remove the model and anything a download left beside it
+    rm -f "$slow" "$slow.sha256" "$slow.part" "$slow.part.aria2"
+    : > "$ua_log"
+}
+
+# Interrupt a download partway, signalling its whole process group so that
+# aria2c, the child of whisper-model, receives it too. setsid gives the download
+# a group of its own, whose id is the PID it reports. SIGTERM rather than
+# SIGINT, since a command started with & in a non-interactive shell inherits
+# SIGINT as ignored, and aria2c stops on SIGTERM as gracefully, saving its
+# control file. The shell dies at once while aria2c is still saving, so the
+# wait is for the whole group rather than for the PID.
+slow_interrupt() {
+    setsid "$wm" download slow >/dev/null 2>&1 &
+    local dl=$!
+    # Existence rather than size. aria2c holds up to 16 MiB in its disk cache
+    # before writing, so this partial stays empty until the download ends.
+    for _ in $(seq 1 200); do
+        [ -e "$slow.part" ] && break
+        sleep 0.01
+    done
+    sleep 0.2
+    kill -TERM -- -"$dl" 2>/dev/null || true
+    wait "$dl" 2>/dev/null || true
+    for _ in $(seq 1 100); do
+        kill -0 -- -"$dl" 2>/dev/null || break
+        sleep 0.05
+    done
+    # A download that finished before the signal arrived would let the resume
+    # assertions below pass on the earlier, complete file.
+    if [ -f "$slow" ]; then
+        printf 'FAIL  the download was interrupted before it finished\n'; fail=1
+    else
+        printf 'ok    the download was interrupted before it finished\n'
+    fi
+}
+
+# With aria2c installed, a fresh download goes through it.
+slow_reset
+status=0; "$wm" download slow >/dev/null 2>&1 || status=$?
+report "a fresh download succeeds with aria2c installed" 0 "$status"
+assert_contains "aria2c fetched it" "$(cat "$ua_log")" "aria2"
+assert_equals "the aria2c download is intact" \
+    "$(sha256sum < "$slow" | cut -d' ' -f1)" "$slow_sha"
+assert_equals "aria2c left no control file" \
+    "$(find "$work/ranged-models" -name '*.aria2' | wc -l)" "0"
+
+# Without aria2c, curl.
+slow_reset
+status=0; PATH="$noaria" "$wm" download slow >/dev/null 2>&1 || status=$?
+report "a fresh download succeeds without aria2c" 0 "$status"
+assert_contains "curl fetched it" "$(cat "$ua_log")" "curl"
+assert_equals "aria2c played no part" \
+    "$(grep -c aria2 "$ua_log" || true)" "0"
+assert_equals "the curl download is intact" \
+    "$(sha256sum < "$slow" | cut -d' ' -f1)" "$slow_sha"
+
+# An interrupted aria2c download resumes through aria2c. Its partial is padded
+# to the advertised size first, since aria2c writes segments out of order and a
+# partial of full length is no evidence of completion while its control file
+# remains. Taking it for complete would discard the bytes on a checksum
+# mismatch rather than resume.
+slow_reset
+slow_interrupt
+if [ -f "$slow.part.aria2" ]; then
+    printf 'ok    an interrupted aria2c download leaves its control file\n'
+else
+    printf 'FAIL  an interrupted aria2c download leaves its control file\n'; fail=1
+fi
+truncate -s 1048576 "$slow.part"
+: > "$ua_log"
+status=0; out=$("$wm" download slow 2>&1) || status=$?
+report "an interrupted aria2c download resumes" 0 "$status"
+assert_equals "the resumed download is intact" \
+    "$(sha256sum < "$slow" | cut -d' ' -f1 2>/dev/null)" "$slow_sha"
+assert_equals "a full-length aria2c partial is not taken for complete" \
+    "$(printf '%s\n' "$out" | grep -c 'complete partial' || true)" "0"
+assert_contains "aria2c resumed it" "$(cat "$ua_log")" "aria2"
+assert_equals "the resume left no control file" \
+    "$(find "$work/ranged-models" -name '*.aria2' | wc -l)" "0"
+
+# Where aria2c is no longer installed, its partial is discarded and curl starts
+# again, since curl would take the partial's holes for a contiguous prefix.
+slow_reset
+slow_interrupt
+: > "$ua_log"
+status=0; out=$(PATH="$noaria" "$wm" download slow 2>&1) || status=$?
+report "an aria2c partial is replaced where aria2c is gone" 0 "$status"
+assert_contains "the aria2c partial is discarded" "$out" "aria2c left"
+assert_equals "the replacement download is intact" \
+    "$(sha256sum < "$slow" | cut -d' ' -f1)" "$slow_sha"
+assert_equals "the discarded partial left no control file" \
+    "$(find "$work/ranged-models" -name '*.aria2' | wc -l)" "0"
+
+# A partial curl left carries no control file and is a contiguous prefix, so
+# curl resumes it even with aria2c installed.
+slow_reset
+head -c 300000 "$work/ranged-blobs/ggml-slow.bin" > "$slow.part"
+status=0; "$wm" download slow >/dev/null 2>&1 || status=$?
+report "a curl partial resumes with aria2c installed" 0 "$status"
+assert_contains "curl resumed it" "$(cat "$ua_log")" "curl"
+assert_equals "aria2c did not touch the curl partial" \
+    "$(grep -c aria2 "$ua_log" || true)" "0"
+assert_equals "the resumed curl download is intact" \
+    "$(sha256sum < "$slow" | cut -d' ' -f1)" "$slow_sha"
+
+# remove takes an aria2c control file with it, as it does the partial.
+printf 'stray' > "$slow.part"
+printf 'stray' > "$slow.part.aria2"
+"$wm" remove slow >/dev/null
+assert_equals "remove deletes an aria2c control file" \
+    "$(find "$work/ranged-models" -name '*.aria2' | wc -l)" "0"
 
 exit "$fail"

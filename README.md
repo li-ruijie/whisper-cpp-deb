@@ -35,6 +35,11 @@ whisper-cli -m "$(whisper-model path base.en)" -f audio.wav
 Models are stored under `$XDG_DATA_HOME/whisper.cpp/models`, overridable with
 `WHISPER_MODEL_DIR`. Set that system-wide to share one read-only model store across users.
 
+Downloads go through aria2c over eight connections when it is installed and through curl
+otherwise. The package does not pull aria2c in, since whether several connections beat one
+depends on the network. An interrupted download resumes with the tool that started it, and a
+partial aria2c left is discarded if aria2c has since been removed.
+
 ## GPU requirements
 
 `whisper-cpp-cuda` needs `cuda-cudart-13-3` and `libcublas-13-3` from NVIDIA's own CUDA apt

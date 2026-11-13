@@ -128,9 +128,10 @@ jobs:
         run: |
           sudo apt-get update
           # gcc builds the ABI stub the smoke test needs, ffmpeg and its ffprobe
-          # serve whisper-audio, and jq serves whisper-model.
+          # serve whisper-audio, and jq and aria2 serve whisper-model, whose
+          # suite fails rather than skip its aria2c half when aria2 is absent.
           sudo apt-get install -y --no-install-recommends \
-            gcc libc6-dev ffmpeg jq python3 dpkg-dev
+            gcc libc6-dev ffmpeg jq aria2 python3 dpkg-dev
 
       - name: Run every suite
         run: |

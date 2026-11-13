@@ -41,9 +41,10 @@ model_dir() {
     fi
 }
 
-auth=()
+auth=() aria_auth=()
 if [ -n "${HF_TOKEN:-}" ]; then
     auth=(-H "Authorization: Bearer $HF_TOKEN")
+    aria_auth=(--header "Authorization: Bearer $HF_TOKEN")
 fi
 
 # Every model the hub currently serves, as "<family> <id> <url>" lines. A
@@ -129,12 +130,21 @@ sidecar_field() {  # sidecar_field <sidecar> <key>
 # terminate the whole shell from inside this function regardless of any ||
 # guard on the caller. cmd_update relies on that to keep going past one
 # model's failure and reach the rest of a bare update.
+#
+# The model body comes through aria2c where it is installed, splitting the file
+# across eight connections, and through curl otherwise. Nothing depends on
+# aria2c, since a single connection already fills a slow link and whether
+# several help is decided by the network the machine sits on. A partial aria2c
+# writes carries a control file beside it. Its segments arrive out of order, so
+# the partial can have holes, only aria2c may continue it, and its length is no
+# evidence that it is complete.
 fetch() {  # fetch <id> <url>
-    local id=$1 url=$2 dir file part meta sha size actual resume=()
+    local id=$1 url=$2 dir file part control meta sha size actual resume=()
     dir=$(model_dir)
     mkdir -p "$dir"
     file="$dir/ggml-$id.bin"
     part="$file.part"
+    control="$part.aria2"
 
     # A failed HEAD must stop here. Called bare from cmd_download errexit would
     # catch it, but called guarded from cmd_update errexit is suspended through
@@ -145,31 +155,53 @@ fetch() {  # fetch <id> <url>
     sha=${meta%% *}
     size=${meta##* }
 
-    if [ -f "$part" ] && [ -n "$size" ] && [ "$(stat -c%s "$part")" = "$size" ]; then
+    # curl would take an aria2c partial's holes for a contiguous prefix, so
+    # without aria2c to continue it the partial is worth nothing.
+    if [ -f "$control" ] && ! command -v aria2c >/dev/null 2>&1; then
+        printf '%s: discarding a partial file aria2c left, aria2c not being installed\n' "$id" >&2
+        rm -f "$part" "$control"
+    fi
+
+    if [ ! -f "$control" ] && [ -f "$part" ] && [ -n "$size" ] \
+        && [ "$(stat -c%s "$part")" = "$size" ]; then
         printf '%s: a complete partial file is already present, verifying\n' "$id"
     else
         # A partial larger than the advertised size sends an unsatisfiable
         # Range, which no amount of retrying fixes, so start it again instead.
         if [ -s "$part" ] && [ -n "$size" ] && [ "$(stat -c%s "$part")" -gt "$size" ]; then
             printf '%s: discarding an oversized partial file\n' "$id" >&2
-            rm -f "$part"
+            rm -f "$part" "$control"
         fi
-        [ -s "$part" ] && resume=(-C -)
         printf 'downloading %s (%s bytes)\n' "$id" "${size:-size unknown}"
-        # --retry-all-errors is deliberately absent. It retries hard 404 and 403
-        # responses five times over 25 seconds to deliver an answer that was
-        # final on the first attempt. The remaining flags still cover transient
-        # failures, which are the ones worth retrying.
-        #
-        # The partial file is deliberately NOT deleted here. This is the one
-        # path that produces a resumable partial, and resume is the reason the
-        # .part file exists at all. The verification failures below do delete
-        # it, since bytes that failed a checksum are worth nothing.
-        curl -fL "${auth[@]}" "${resume[@]}" \
-            --retry 5 --retry-delay 5 --retry-connrefused \
-            -o "$part" "$url" \
-            || { printf '%s: %s\n' "$self" \
-                   "download failed for $id (partial kept for resume)" >&2; return 1; }
+        # Neither path deletes the partial on failure. Resume is the reason
+        # the .part file exists at all, and the verification failures below do
+        # delete it, since bytes that failed a checksum are worth nothing.
+        if command -v aria2c >/dev/null 2>&1 && { [ ! -s "$part" ] || [ -f "$control" ]; }; then
+            # A partial curl left has no control file and goes to curl below,
+            # so aria2c starts afresh or continues one of its own. --continue
+            # is what makes it read its control file rather than refuse the
+            # existing partial. The header follows a redirect to the CDN, which
+            # accepted it from Hugging Face on 2026-11-13.
+            [ -s "$part" ] || rm -f "$part"
+            aria2c "${aria_auth[@]}" --continue=true \
+                --split=8 --max-connection-per-server=8 --file-allocation=none \
+                --auto-file-renaming=false --max-tries=5 --retry-wait=5 \
+                --console-log-level=warn --summary-interval=0 --download-result=hide \
+                --dir="$dir" --out="${part##*/}" "$url" \
+                || { printf '%s: %s\n' "$self" \
+                       "download failed for $id (partial kept for resume)" >&2; return 1; }
+        else
+            [ -s "$part" ] && resume=(-C -)
+            # --retry-all-errors is deliberately absent. It retries hard 404 and
+            # 403 responses five times over 25 seconds to deliver an answer that
+            # was final on the first attempt. The remaining flags still cover
+            # transient failures, which are the ones worth retrying.
+            curl -fL "${auth[@]}" "${resume[@]}" \
+                --retry 5 --retry-delay 5 --retry-connrefused \
+                -o "$part" "$url" \
+                || { printf '%s: %s\n' "$self" \
+                       "download failed for $id (partial kept for resume)" >&2; return 1; }
+        fi
     fi
 
     actual=$(local_sha "$part")
@@ -308,7 +340,7 @@ cmd_remove() {
     for id in "$@"; do
         file="$dir/ggml-$id.bin"
         [ -f "$file" ] || { printf '%s: not installed\n' "$id" >&2; continue; }
-        rm -f "$file" "$file.sha256" "$file.part"
+        rm -f "$file" "$file.sha256" "$file.part" "$file.part.aria2"
         printf 'removed %s\n' "$id"
     done
 }
