@@ -31,12 +31,14 @@ fi
 
 # Every executable this machine has except aria2c, which stands in for a
 # machine without it. Built from the directories rather than from a list of
-# the tools whisper-model calls, which would go stale silently.
+# the tools whisper-model calls, which would go stale silently. A name already
+# linked is tested with -L, since -e is false for a link to a missing target,
+# and Ubuntu ships such links in /usr/bin, which /bin repeats.
 noaria="$work/noaria"
 mkdir -p "$noaria"
 for f in /usr/bin/* /bin/*; do
     n=${f##*/}
-    [ "$n" = aria2c ] || [ -e "$noaria/$n" ] || ln -s "$f" "$noaria/$n"
+    [ "$n" = aria2c ] || [ -L "$noaria/$n" ] || ln -s "$f" "$noaria/$n"
 done
 
 # Bind to an ephemeral port and read back what the kernel gave us, rather than
