@@ -102,7 +102,7 @@ jobs:
           echo "asset_tag=$ASSET_TAG" >> "$GITHUB_OUTPUT"
 
           DEPLOYED=$(curl -fsSL \
-            https://apt.leefy.net/dists/stable/dynamic/binary-amd64/Packages 2>/dev/null \
+            https://li-ruijie.github.io/apt/dists/stable/dynamic/binary-amd64/Packages 2>/dev/null \
             | awk '/^Package: whisper-cpp$/,/^$/' | grep '^Version:' | awk '{print $2}' || true)
 
           # Captured before it is written, so a refusal leaves no partial
