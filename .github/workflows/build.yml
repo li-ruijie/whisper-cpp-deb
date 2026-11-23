@@ -101,9 +101,14 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "asset_tag=$ASSET_TAG" >> "$GITHUB_OUTPUT"
 
-          DEPLOYED=$(curl -fsSL \
-            https://apt.leefy.net/dists/stable/dynamic/binary-amd64/Packages 2>/dev/null \
-            | awk '/^Package: whisper-cpp$/,/^$/' | grep '^Version:' | awk '{print $2}' || true)
+          # A fetch error fails the job. Read as nothing deployed, it built 1.9.5 over the
+          # deployed 1.9.5-1 on 2026-11-23. A package not yet published still builds, as the
+          # fetch then succeeds and the version comes back empty.
+          PACKAGES=$(curl -fsSL --retry 3 \
+            https://apt.leefy.net/dists/stable/dynamic/binary-amd64/Packages) \
+            || { echo "::error::Could not read the deployed index from apt.leefy.net"; exit 1; }
+          DEPLOYED=$(printf '%s\n' "$PACKAGES" | awk '/^Package: whisper-cpp$/,/^$/' \
+            | awk '/^Version:/ {print $2}')
 
           # Captured before it is written, so a refusal leaves no partial
           # output behind for a later job to read.
