@@ -1,7 +1,7 @@
 # whisper.cpp Debian packages
 
 Builds `whisper-cpp`, `whisper-cpp-cuda`, and `whisper-cpp-vulkan` for the APT repository at
-https://li-ruijie.github.io/apt/. Upstream publishes Linux CPU binaries only, so both GPU
+https://apt.leefy.net/. Upstream publishes Linux CPU binaries only, so both GPU
 backends are compiled here.
 
 ## Packages
