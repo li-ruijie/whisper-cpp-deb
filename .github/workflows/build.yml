@@ -91,42 +91,41 @@ jobs:
           # checks below, run here as well so that nothing is fetched first.
           scripts/decide-build.sh "$TAG" "$REVISION" "" false > /dev/null
 
-          # Every release up to v1.9.2 carried its own archives, and from v1.9.3
-          # they sit on the nightly cut from the same commit, so prefer the
-          # semantic release and fall back to that nightly. Matching on the
-          # commit rather than on publication order, since a nightly for an
-          # entirely different commit is worse than no build at all.
-          if gh api "repos/ggml-org/whisper.cpp/releases/tags/$TAG" \
-               --jq '.assets[].name' | grep -qx 'whisper-bin-ubuntu-x64.tar.gz'; then
-            ASSET_TAG="$TAG"
-          else
-            SHA=$(gh api "repos/ggml-org/whisper.cpp/commits/$TAG" --jq '.sha')
-            ASSET_TAG=""
-            for cand in $(gh api 'repos/ggml-org/whisper.cpp/releases?per_page=100' \
-                            --jq '.[] | select(.tag_name | test("^b[0-9]+$")) | .tag_name'); do
-              if [ "$(gh api "repos/ggml-org/whisper.cpp/commits/$cand" --jq '.sha')" = "$SHA" ]; then
-                ASSET_TAG="$cand"
-                break
-              fi
-            done
-            if [ -z "$ASSET_TAG" ]; then
-              echo "::error::no release carries the archives for $TAG, at commit $SHA"
-              exit 1
-            fi
-          fi
-
-          echo "Upstream $TAG, archives from $ASSET_TAG"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "asset_tag=$ASSET_TAG" >> "$GITHUB_OUTPUT"
-
           # A fetch error fails the job. Read as nothing deployed, it built 1.9.5 over the
           # deployed 1.9.5-1 on 2026-11-23. A package not yet published still builds, as the
-          # fetch then succeeds and the version comes back empty.
+          # fetch then succeeds and the version comes back empty. Read before the archives,
+          # so an unreadable index fails the run even when there is nothing to build.
           PACKAGES=$(curl -fsSL --retry 3 \
             https://apt.leefy.net/dists/stable/dynamic/binary-amd64/Packages) \
             || { echo "::error::Could not read the deployed index from apt.leefy.net"; exit 1; }
           DEPLOYED=$(printf '%s\n' "$PACKAGES" | awk '/^Package: whisper-cpp$/,/^$/' \
             | awk '/^Version:/ {print $2}')
+
+          # A release published with no Linux archives fails the first run to
+          # see it and is skipped after that, decide-no-archives.sh explaining
+          # why. An API error fails inside find-archives.sh either way.
+          ASSET_TAG=$(scripts/find-archives.sh "$TAG")
+          if [ -z "$ASSET_TAG" ]; then
+            SHA=$(gh api "repos/ggml-org/whisper.cpp/commits/$TAG" --jq '.sha')
+            PUBLISHED=$(gh api "repos/ggml-org/whisper.cpp/releases/tags/$TAG" \
+              --jq '.published_at')
+            EXPLICIT=false
+            if [ -n "$VERSION_OVERRIDE$REVISION" ] || [ "$FORCE" = true ]; then
+              EXPLICIT=true
+            fi
+            if scripts/decide-no-archives.sh "$PUBLISHED" "$(date -u +%s)" "$EXPLICIT"; then
+              echo "::notice::upstream published no Linux archives for $TAG," \
+                "at commit $SHA, so there is nothing to build"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::no release carries the archives for $TAG, at commit $SHA"
+            exit 1
+          fi
+
+          echo "Upstream $TAG, archives from $ASSET_TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset_tag=$ASSET_TAG" >> "$GITHUB_OUTPUT"
 
           # Captured before it is written, so a refusal leaves no partial
           # output behind for a later job to read.
