@@ -89,7 +89,12 @@ jobs:
           # Guards the override, the resolver above being unable to return
           # anything else, and the revision. decide-build.sh repeats both
           # checks below, run here as well so that nothing is fetched first.
-          scripts/decide-build.sh "$TAG" "$REVISION" "" false > /dev/null
+          # Its reason is shown only on a refusal, as on success it reports a
+          # build against nothing deployed, before the index has been read.
+          if ! reason=$(scripts/decide-build.sh "$TAG" "$REVISION" "" false 2>&1 > /dev/null); then
+            echo "$reason" >&2
+            exit 1
+          fi
 
           # A fetch error fails the job. Read as nothing deployed, it built 1.9.5 over the
           # deployed 1.9.5-1 on 2026-11-23. A package not yet published still builds, as the
