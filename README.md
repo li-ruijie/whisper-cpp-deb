@@ -59,15 +59,19 @@ The workflow runs weekly and can be dispatched manually with a `version` overrid
 `force` flag, and a `revision`. A revision ships a packaging change against an unchanged
 upstream version, so `1` builds `1.9.5-1` under the release `v1.9.5-1`, which apt sorts above
 `1.9.5`. The weekly run passes none and skips an upstream version already deployed under any
-revision. A version apt would sort below the deployed one is refused. The scripts run
-standalone:
+revision. A version apt would sort below the deployed one is refused. An upstream release can
+carry no Linux archives, as v1.9.6 does not. A weekly run then fails while that release is under
+8 days old, so that GitHub reports it once by email, and skips it after that. A dispatched run
+that sets any input fails instead. The scripts run standalone:
 
 ```sh
-scripts/decide-build.sh   <tag> <revision> <deployed> <force>
-scripts/package-base.sh   <tarball> <version> <arch> <outdir>
-scripts/package-cuda.sh   <libggml-cuda.so> <version> <cuda-suffix> <outdir>
-scripts/package-vulkan.sh <libggml-vulkan.so> <version> <outdir>
-scripts/smoke-test.sh     <base.deb> [backend.deb]
+scripts/find-archives.sh      <tag>
+scripts/decide-no-archives.sh <published> <now> <explicit>
+scripts/decide-build.sh       <tag> <revision> <deployed> <force>
+scripts/package-base.sh       <tarball> <version> <arch> <outdir>
+scripts/package-cuda.sh       <libggml-cuda.so> <version> <cuda-suffix> <outdir>
+scripts/package-vulkan.sh     <libggml-vulkan.so> <version> <outdir>
+scripts/smoke-test.sh         <base.deb> [backend.deb]
 ```
 
 Upstream whisper.cpp is MIT licensed. Its `LICENSE` ships in the base package at
